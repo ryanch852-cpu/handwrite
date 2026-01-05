@@ -219,7 +219,6 @@ class HandwriteProcessor(VideoProcessorBase):
 # --- 4. Streamlit 介面 ---
 st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", layout="wide")
 
-# [修改] 初始化統計變數 (分成兩個獨立的字典)
 if 'stats' not in st.session_state:
     st.session_state['stats'] = {
         'camera': {'total': 0, 'correct': 0},
@@ -236,21 +235,33 @@ with st.sidebar:
     app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式"])
     st.divider()
     
-    # [修改] 根據模式顯示對應的統計數據
-    if app_mode == "📷 攝影機模式 (Live)":
-        current_stats = st.session_state['stats']['camera']
-        st.subheader("📷 鏡頭成績")
-    else:
-        current_stats = st.session_state['stats']['handwriting']
-        st.subheader("🎨 手寫成績")
-        
-    total = current_stats['total']
-    correct = current_stats['correct']
-    acc = (correct / total * 100) if total > 0 else 0.0
+    # [修改] 同時顯示兩邊的成績
     
-    st.metric("總數 (Total)", total)
-    st.metric("正確 (Correct)", correct)
-    st.metric("準確率", f"{acc:.1f}%")
+    # 1. 鏡頭成績區
+    st.markdown("### 📷 鏡頭成績")
+    c_total = st.session_state['stats']['camera']['total']
+    c_correct = st.session_state['stats']['camera']['correct']
+    c_acc = (c_correct / c_total * 100) if c_total > 0 else 0.0
+    
+    col_c1, col_c2 = st.columns(2)
+    with col_c1: st.metric("總數", c_total)
+    with col_c2: st.metric("正確", c_correct)
+    st.metric("鏡頭準確率", f"{c_acc:.1f}%")
+
+    st.divider()
+
+    # 2. 手寫成績區
+    st.markdown("### 🎨 手寫成績")
+    h_total = st.session_state['stats']['handwriting']['total']
+    h_correct = st.session_state['stats']['handwriting']['correct']
+    h_acc = (h_correct / h_total * 100) if h_total > 0 else 0.0
+
+    col_h1, col_h2 = st.columns(2)
+    with col_h1: st.metric("總數", h_total)
+    with col_h2: st.metric("正確", h_correct)
+    st.metric("手寫準確率", f"{h_acc:.1f}%")
+
+    st.divider()
     
     if st.button("🔄 重置所有統計"):
         st.session_state['stats'] = {
@@ -290,7 +301,7 @@ if app_mode == "📷 攝影機模式 (Live)":
         with c2:
             st.write("##") 
             if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
-                # 1. 解除凍結
+                # 1. 先解除凍結
                 if ctx.video_processor:
                     ctx.video_processor.resume()
                 
