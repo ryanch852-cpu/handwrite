@@ -4,7 +4,9 @@ import numpy as np
 import os
 import time
 import av
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 
 # 設定 TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -17,7 +19,7 @@ SHRINK_PX = 4
 STABILITY_DURATION = 1.2
 MOVEMENT_THRESHOLD = 80
 
-# --- 1. 載入模型 (全域快取) ---
+# --- 1. 載入模型 ---
 @st.cache_resource
 def load_ai_model():
     if os.path.exists("mnist_cnn.h5"):
@@ -29,88 +31,45 @@ def load_ai_model():
 
 model = load_ai_model()
 
-# --- 2. 定義影像處理核心 (類似原本的 Class) ---
+# --- 2. 核心功能: 膚色過濾 ---
+def is_valid_content(img_bgr):
+    if img_bgr is None or img_bgr.size == 0: return False
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mean_h = np.mean(hsv[:,:,0])
+    mean_s = np.mean(hsv[:,:,1])
+    if mean_s > 60: return False
+    if 30 < mean_s <= 60:
+        if (mean_h < 25 or mean_h > 155): return False
+    return True
+
+# --- 3. WebRTC 影像處理器 (鏡頭模式專用) ---
 class HandwriteProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = model
         self.last_boxes = []
         self.stability_start_time = None
-        self.is_captured = False
-        self.capture_cooldown = 0
-        self.captured_frame = None
-        
-    # 膚色過濾
-    def is_valid_content(self, img_bgr):
-        if img_bgr is None or img_bgr.size == 0: return False
-        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-        mean_h = np.mean(hsv[:,:,0])
-        mean_s = np.mean(hsv[:,:,1])
-        if mean_s > 60: return False
-        if 30 < mean_s <= 60:
-            if (mean_h < 25 or mean_h > 155): return False
-        return True
+        self.frozen = False       # 是否凍結中
+        self.frozen_frame = None  # 凍結的畫面
+        self.detected_count = 0   # 偵測到的數量
 
-    # 穩定度檢查
-    def check_stability(self, current_boxes):
-        if len(current_boxes) == 0:
-            self.stability_start_time = None
-            return False, 0.0
-        
-        if len(self.last_boxes) == 0:
-            self.last_boxes = current_boxes
-            self.stability_start_time = time.time()
-            return False, 0.0
+    # 外部呼叫此函式來解除凍結
+    def resume(self):
+        self.frozen = False
+        self.stability_start_time = None
+        self.last_boxes = []
 
-        total_movement = 0
-        for curr_box in current_boxes:
-            c_x, c_y, c_w, c_h = curr_box["box"]
-            min_dist = 99999
-            for last_box in self.last_boxes:
-                l_x, l_y, l_w, l_h = last_box["box"]
-                dist = abs(c_x - l_x) + abs(c_y - l_y)
-                if dist < min_dist: min_dist = dist
-            
-            if min_dist < 30: total_movement += min_dist
-            else: total_movement += 20 
-
-        count_diff = abs(len(current_boxes) - len(self.last_boxes))
-        total_movement += count_diff * 30 
-        self.last_boxes = current_boxes
-
-        if total_movement < MOVEMENT_THRESHOLD:
-            if self.stability_start_time is None:
-                self.stability_start_time = time.time()
-            elapsed = time.time() - self.stability_start_time
-            progress = min(elapsed / STABILITY_DURATION, 1.0)
-            return (elapsed >= STABILITY_DURATION), progress
-        else:
-            self.stability_start_time = time.time()
-            return False, 0.0
-
-    # 每一個影格都會跑進來這裡處理
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
-        # 如果處於「已抓拍凍結」狀態，顯示凍結畫面
-        current_time = time.time()
-        if self.is_captured:
-            if current_time < self.capture_cooldown:
-                # 保持顯示同一張圖，並顯示倒數
-                display_img = self.captured_frame.copy()
-                remaining = int(self.capture_cooldown - current_time) + 1
-                cv2.putText(display_img, f"CAPTURED! Reset: {remaining}s", (20, 60), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                return av.VideoFrame.from_ndarray(display_img, format="bgr24")
-            else:
-                # 時間到，解鎖
-                self.is_captured = False
-                self.stability_start_time = None
+        # [狀態 A] 如果凍結中，永遠回傳同一張圖，直到被叫醒
+        if self.frozen:
+            return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
         
-        # --- Live 偵測流程 ---
+        # [狀態 B] Live 偵測模式
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        # 1. 繪製藍色 ROI 框 (你最想要的！)
+        # 1. 繪製藍色 ROI 框
         roi_rect = [10, 10, w_f - 20, h_f - 20]
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
@@ -144,23 +103,20 @@ class HandwriteProcessor(VideoProcessorBase):
         # 4. 批量預測
         batch_rois = []
         batch_info = []
-        raw_boxes_for_stability = [] # 用來算穩定度的
+        raw_boxes_for_stability = [] 
         
         for item in valid_boxes:
             x, y, w, h = item["box"]
             rx, ry = x + roi_rect[0], y + roi_rect[1]
             
-            # 邊緣過濾
             if x < 15 or y < 15 or (x+w) > binary_proc.shape[1]-15 or (y+h) > binary_proc.shape[0]-15: continue
             if h < MIN_HEIGHT: continue
             
-            # 膚色過濾 (在原圖上切)
             roi_color = display_img[ry:ry+h, rx:rx+w]
-            if not self.is_valid_content(roi_color): continue
+            if not is_valid_content(roi_color): continue
             
             raw_boxes_for_stability.append(item)
             
-            # CNN Padding
             roi_single = binary_proc[y:y+h, x:x+w]
             side = max(w, h)
             padding = int(side * 0.2)
@@ -180,8 +136,9 @@ class HandwriteProcessor(VideoProcessorBase):
                 "aspect": item["aspect_ratio"]
             })
             
-        # 5. 執行預測與繪圖
+        detected_count = 0
         detected_something = False
+        
         if len(batch_rois) > 0 and self.model is not None:
             detected_something = True
             batch_input = np.stack(batch_rois)
@@ -196,7 +153,6 @@ class HandwriteProcessor(VideoProcessorBase):
                     has_hole = info["has_hole"]
                     aspect = info["aspect"]
                     
-                    # 混合修正
                     if res_id == 1:
                         if aspect > 0.45: res_id = 7
                     elif res_id == 7:
@@ -205,7 +161,6 @@ class HandwriteProcessor(VideoProcessorBase):
                     if res_id == 9 and not has_hole and confidence < 0.95: res_id = 7
                     if res_id == 0 and aspect < 0.5: res_id = 1
                     
-                    # 畫綠框 (內縮)
                     draw_x = rx + SHRINK_PX
                     draw_y = ry + SHRINK_PX
                     draw_w = max(1, w - (SHRINK_PX * 2))
@@ -213,51 +168,206 @@ class HandwriteProcessor(VideoProcessorBase):
                     
                     cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), (0, 255, 0), 2)
                     cv2.putText(display_img, str(res_id), (rx, ry-8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    detected_count += 1
             except:
-                pass # 避免 TensorFlow 執行緒衝突
+                pass
 
-        # 6. 穩定度與進度條
-        is_stable, progress = self.check_stability(raw_boxes_for_stability)
-        
-        # 畫進度條
-        bar_w = int(600 * progress)
-        color = (0, 255, 255) if progress < 1.0 else (0, 255, 0)
-        # 固定在畫面下方
-        cv2.rectangle(display_img, (20, h_f - 40), (20 + bar_w, h_f - 25), color, -1)
-        cv2.rectangle(display_img, (20, h_f - 40), (620, h_f - 25), (255, 255, 255), 2)
-        
-        # 觸發抓拍
-        if is_stable and detected_something:
-            self.is_captured = True
-            self.capture_cooldown = time.time() + 3.0 # 凍結 3 秒
-            self.captured_frame = display_img.copy() # 存下這一瞬間的畫面
-            cv2.putText(display_img, "CAPTURED!", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        self.detected_count = detected_count
+
+        # 5. 穩定度偵測
+        if len(raw_boxes_for_stability) == 0:
+            self.stability_start_time = None
+        elif len(self.last_boxes) == 0:
+            self.last_boxes = raw_boxes_for_stability
+            self.stability_start_time = time.time()
+        else:
+            total_movement = 0
+            for curr_box in raw_boxes_for_stability:
+                c_x, c_y, c_w, c_h = curr_box["box"]
+                min_dist = 99999
+                for last_box in self.last_boxes:
+                    l_x, l_y, l_w, l_h = last_box["box"]
+                    dist = abs(c_x - l_x) + abs(c_y - l_y)
+                    if dist < min_dist: min_dist = dist
+                if min_dist < 30: total_movement += min_dist
+                else: total_movement += 20 
             
+            count_diff = abs(len(raw_boxes_for_stability) - len(self.last_boxes))
+            total_movement += count_diff * 30 
+            self.last_boxes = raw_boxes_for_stability
+
+            if total_movement < MOVEMENT_THRESHOLD:
+                if self.stability_start_time is None: self.stability_start_time = time.time()
+                elapsed = time.time() - self.stability_start_time
+                progress = min(elapsed / STABILITY_DURATION, 1.0)
+                
+                # 畫進度條
+                bar_w = int(600 * progress)
+                color = (0, 255, 255) if progress < 1.0 else (0, 255, 0)
+                cv2.rectangle(display_img, (20, h_f - 40), (20 + bar_w, h_f - 25), color, -1)
+                cv2.rectangle(display_img, (20, h_f - 40), (620, h_f - 25), (255, 255, 255), 2)
+                
+                # [關鍵修改] 穩定後 -> 凍結 -> 等待手動解除
+                if elapsed >= STABILITY_DURATION and detected_something:
+                    self.frozen = True
+                    # 在畫面上印出等待訊息
+                    cv2.putText(display_img, "CAPTURED! Waiting for Input...", (20, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                    self.frozen_frame = display_img.copy()
+            else:
+                self.stability_start_time = time.time()
+
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
-# --- 3. 介面部分 ---
-st.set_page_config(page_title="手寫辨識 (Live版)", page_icon="📹", layout="wide")
+# --- 4. Streamlit 介面 ---
+st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", layout="wide")
 
-st.title("📹 手寫數字辨識 (即時影像版)")
-st.caption("現在畫面會即時顯示藍框與辨識結果，手穩住後會自動倒數抓拍！")
+# 初始化統計
+if 'stats' not in st.session_state:
+    st.session_state['stats'] = {'total': 0, 'correct': 0}
+
+# 側邊欄
+with st.sidebar:
+    st.title("🎛️ 控制台")
+    app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式"])
+    
+    st.divider()
+    total = st.session_state['stats']['total']
+    correct = st.session_state['stats']['correct']
+    acc = (correct / total * 100) if total > 0 else 0.0
+    st.metric("總數 (Total)", total)
+    st.metric("正確 (Correct)", correct)
+    st.metric("準確率", f"{acc:.1f}%")
+    
+    if st.button("🔄 重置統計"):
+        st.session_state['stats'] = {'total': 0, 'correct': 0}
+        st.rerun()
+
+st.title("📝 手寫數字辨識系統")
 
 if model is None:
     st.error("❌ 找不到 `mnist_cnn.h5`！")
     st.stop()
 
-# 啟動 WebRTC 串流
-webrtc_ctx = webrtc_streamer(
-    key="handwriting-cnn",
-    video_processor_factory=HandwriteProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    rtc_configuration=RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
-)
+# --- 5. 模式處理 ---
 
-st.divider()
-st.markdown("**操作說明:**")
-st.markdown("1. 點擊 `START` 開啟攝影機。")
-st.markdown("2. 藍色框框會自動對準畫面。")
-st.markdown("3. **將數字卡片拿穩**，下方進度條會開始跑。")
-st.markdown("4. 進度條滿了會顯示 **CAPTURED** 並凍結 3 秒方便你看結果。")
+# [模式 A] 攝影機 Live 模式
+if app_mode == "📷 攝影機模式 (Live)":
+    st.info("💡 手持紙張保持穩定，進度條滿後會**自動凍結**，等你按「繼續」才會解鎖。")
+    
+    # 建立 WebRTC 串流
+    ctx = webrtc_streamer(
+        key="handwrite-live",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=HandwriteProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        async_processing=True,
+    )
+
+    # 控制按鈕區
+    col1, col2 = st.columns([1, 1])
+    
+    # 手動紀錄按鈕
+    with col1:
+        manual_score = st.number_input("✍️ 輸入正確數量 (Input Score)", min_value=0, value=0)
+    
+    with col2:
+        st.write("##") # 排版
+        # 這個按鈕做兩件事：1. 存成績 2. 解除凍結
+        if st.button("💾 儲存並繼續 (Save & Resume)", type="primary"):
+            # 1. 存成績
+            if manual_score > 0:
+                # 這裡我們無法精確知道 detected_count，只能用使用者輸入的
+                # 因為 WebRTC 是異步的，很難即時把 count 傳回來
+                # 假設 total = score (或依使用者輸入)
+                st.session_state['stats']['total'] += manual_score 
+                st.session_state['stats']['correct'] += manual_score
+                st.success(f"已記錄 {manual_score} 筆資料！")
+                time.sleep(0.5)
+                st.rerun()
+            
+            # 2. 解除凍結 (關鍵！)
+            if ctx.video_processor:
+                ctx.video_processor.resume()
+
+# [模式 B] 手寫板模式 (你的舊愛)
+elif app_mode == "🎨 手寫板模式":
+    st.info("直接在下方書寫，放開滑鼠自動辨識。")
+    
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0.3)",
+        stroke_width=15,
+        stroke_color="#FFFFFF",
+        background_color="#000000",
+        height=300,
+        width=600,
+        drawing_mode="freedraw",
+        key="canvas",
+    )
+    
+    if canvas_result.image_data is not None:
+        img_data = canvas_result.image_data.astype(np.uint8)
+        if np.max(img_data) > 0:
+            # 簡單辨識邏輯 (與 Live 模式共用部分代碼太冗長，這裡簡化重寫核心)
+            if img_data.shape[2] == 4:
+                img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
+            
+            gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
+            binary_proc = cv2.dilate(gray, None, iterations=1)
+            _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
+            
+            contours, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
+            
+            draw_img = img_data.copy()
+            detected_count = 0
+            
+            batch_rois = []
+            batch_coords = []
+            
+            for cnt in contours:
+                if cv2.contourArea(cnt) > MIN_AREA:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    # Preprocessing
+                    roi = binary_proc[y:y+h, x:x+w]
+                    side = max(w, h)
+                    pad = int(side * 0.2)
+                    container = np.zeros((side+pad*2, side+pad*2), dtype=np.uint8)
+                    ox, oy = (side+pad*2-w)//2, (side+pad*2-h)//2
+                    container[oy:oy+h, ox:ox+w] = roi
+                    roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
+                    roi_ready = roi_ready.astype('float32') / 255.0
+                    roi_ready = roi_ready.reshape(28, 28, 1)
+                    
+                    batch_rois.append(roi_ready)
+                    batch_coords.append((x, y, w, h))
+            
+            if len(batch_rois) > 0:
+                preds = model.predict(np.stack(batch_rois), verbose=0)
+                for i, pred in enumerate(preds):
+                    res_id = np.argmax(pred)
+                    x, y, w, h = batch_coords[i]
+                    
+                    # 簡單修正 (手寫板環境單純，規則可以少一點)
+                    asp = w/h
+                    if res_id==1 and asp>0.5: res_id=7
+                    if res_id==7 and asp<0.3: res_id=1
+                    
+                    cv2.rectangle(draw_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    detected_count += 1
+            
+            st.image(draw_img, channels="BGR")
+            st.success(f"偵測到 {detected_count} 個數字")
+            
+            # 手寫板成績輸入
+            col1, col2 = st.columns([1,1])
+            with col1:
+                hw_score = st.number_input("輸入數量", min_value=0, value=detected_count, key="hw_input")
+            with col2:
+                st.write("##")
+                if st.button("儲存成績", key="hw_save"):
+                    st.session_state['stats']['total'] += detected_count
+                    st.session_state['stats']['correct'] += hw_score
+                    st.rerun()
