@@ -62,11 +62,9 @@ class HandwriteProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
-        # [狀態 A] 凍結中
         if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
         
-        # [狀態 B] Live 偵測
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
@@ -267,7 +265,7 @@ with st.sidebar:
 
 st.title("📝 手寫數字辨識系統")
 
-# [新增] 操作說明 (折疊式)
+# 操作說明
 with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
     st.markdown("""
     #### 1. 📷 攝影機模式 (Live)
@@ -275,12 +273,12 @@ with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
     * 將手寫數字紙張置於藍色框框內。
     * **保持手部穩定**，下方進度條會開始跑，跑滿後畫面會自動顯示 **"CAPTURED"** 並凍結。
     * 畫面凍結後，請在下方輸入正確的數字數量。
-    * 點擊 **"💾 儲存並繼續"**，系統會記錄成績並解除凍結，準備下一次辨識。
+    * 點擊 **"💾 儲存並繼續"**，系統會記錄成績並解除凍結。
 
     #### 2. 🎨 手寫板模式
     * 切換至左側選單的「手寫板模式」。
-    * 直接在黑色畫布上用滑鼠書寫數字 (支援多個數字)。
-    * 放開滑鼠後系統會自動辨識。
+    * 直接在黑色畫布上用滑鼠書寫數字。
+    * 放開滑鼠後，**右側**會即時顯示辨識結果。
     * 若要重寫，點擊畫布上方的 **"🗑️ 清除畫布"** 按鈕。
     """)
 
@@ -328,27 +326,31 @@ if app_mode == "📷 攝影機模式 (Live)":
                 st.rerun()
 
 elif app_mode == "🎨 手寫板模式":
+    st.info("直接在下方書寫，放開滑鼠自動辨識。")
     
-    c_left, c_right = st.columns([7, 3])
+    # [修改] 使用左右分欄佈局 (左3 : 右1)
+    col_canvas, col_result = st.columns([3, 1])
 
-    with c_left:
+    with col_canvas:
         if st.button("🗑️ 清除畫布"):
             st.session_state['canvas_key'] = f"canvas_{time.time()}"
             st.rerun()
 
+        # [修改] 畫布加寬加高
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
             stroke_width=15,
             stroke_color="#FFFFFF",
             background_color="#000000",
-            height=350, 
-            width=800,  
+            height=400,  # 加高
+            width=850,   # 加寬
             drawing_mode="freedraw",
             key=st.session_state['canvas_key'],
         )
 
-    with c_right:
-        st.write("### 👁️ 辨識結果")
+    # 右側結果區
+    with col_result:
+        st.markdown("### 👁️ 結果")
         
         if canvas_result.image_data is not None:
             img_data = canvas_result.image_data.astype(np.uint8)
@@ -394,22 +396,23 @@ elif app_mode == "🎨 手寫板模式":
                         cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                         detected_count += 1
                 
+                # 顯示結果縮圖
                 st.image(draw_img, channels="BGR", use_container_width=True)
                 
                 if detected_count > 0:
-                    st.success(f"偵測數: {detected_count}")
+                    st.success(f"偵測: {detected_count}")
                 else:
-                    st.warning("未偵測到數字")
+                    st.warning("無數字")
 
                 st.write("---")
-                hw_score = st.number_input("✍️ 正確數量", min_value=0, value=detected_count, key="hw_input")
+                hw_score = st.number_input("輸入數量", min_value=0, value=detected_count, key="hw_input")
                 
                 st.write("##")
-                if st.button("💾 儲存手寫成績", key="hw_save", type="primary"):
+                if st.button("💾 儲存", key="hw_save", type="primary"):
                     st.session_state['stats']['handwriting']['total'] += detected_count
                     st.session_state['stats']['handwriting']['correct'] += hw_score
                     st.toast("✅ 手寫成績已儲存！")
                     time.sleep(0.5)
                     st.rerun()
             else:
-                st.info("請在左側畫布書寫...")
+                st.info("請在左側書寫")
