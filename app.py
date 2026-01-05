@@ -18,10 +18,8 @@ MIN_AREA = 140
 SHRINK_PX = 4
 STABILITY_DURATION = 1.2
 MOVEMENT_THRESHOLD = 80
-
-# [視覺設定]
-ROI_MARGIN = 60  # 藍框邊距 (數字越大，框越小)
-TEXT_Y_OFFSET = 15 # 文字與藍框的距離
+ROI_MARGIN = 60  
+TEXT_Y_OFFSET = 15 
 
 # --- 1. 載入模型 ---
 @st.cache_resource
@@ -56,7 +54,6 @@ class HandwriteProcessor(VideoProcessorBase):
         self.frozen_frame = None  
         self.detected_count = 0   
 
-    # 解除凍結
     def resume(self):
         self.frozen = False
         self.stability_start_time = None
@@ -73,16 +70,12 @@ class HandwriteProcessor(VideoProcessorBase):
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        # [修改] 1. 繪製藍色 ROI 框 (更小)
-        # ROI_MARGIN = 60，代表上下左右都空出 60 像素，框就變小了
         roi_rect = [ROI_MARGIN, ROI_MARGIN, w_f - 2*ROI_MARGIN, h_f - 2*ROI_MARGIN]
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
         
-        # 影像前處理 (只處理框內)
         roi_img = img[roi_rect[1]:roi_rect[1]+roi_rect[3], roi_rect[0]:roi_rect[0]+roi_rect[2]]
         
-        # 防呆：如果框太小導致沒有影像
         if roi_img.size == 0:
              return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
@@ -91,7 +84,6 @@ class HandwriteProcessor(VideoProcessorBase):
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 18)
         binary_proc = cv2.dilate(thresh, None, iterations=2)
         
-        # 找輪廓
         contours, hierarchy = cv2.findContours(binary_proc, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         
         valid_boxes = []
@@ -110,17 +102,14 @@ class HandwriteProcessor(VideoProcessorBase):
         
         valid_boxes = sorted(valid_boxes, key=lambda b: b["box"][0])
         
-        # 批量預測
         batch_rois = []
         batch_info = []
         raw_boxes_for_stability = [] 
         
         for item in valid_boxes:
             x, y, w, h = item["box"]
-            # 座標轉換：因為是在 ROI 裡找到的，要加回 ROI 的起始點
             rx, ry = x + roi_rect[0], y + roi_rect[1]
             
-            # 過濾邏輯 (基於 ROI 內的小圖)
             if x < 5 or y < 5 or (x+w) > binary_proc.shape[1]-5 or (y+h) > binary_proc.shape[0]-5: continue
             if h < MIN_HEIGHT: continue
             
@@ -185,7 +174,6 @@ class HandwriteProcessor(VideoProcessorBase):
 
         self.detected_count = detected_count
 
-        # 穩定度與抓拍
         if len(raw_boxes_for_stability) == 0:
             self.stability_start_time = None
         elif len(self.last_boxes) == 0:
@@ -219,8 +207,6 @@ class HandwriteProcessor(VideoProcessorBase):
                 
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
-                    # [修改] 2. 將 CAPTURED 文字移到藍框上方
-                    # 藍框的頂部是 ROI_MARGIN (60)，文字放在 60 - 15 = 45 的位置
                     text_y = max(30, ROI_MARGIN - TEXT_Y_OFFSET) 
                     cv2.putText(display_img, "CAPTURED! Waiting for Input...", (ROI_MARGIN, text_y), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -237,6 +223,9 @@ if 'stats' not in st.session_state:
     st.session_state['stats'] = {'total': 0, 'correct': 0}
 if 'input_key' not in st.session_state:
     st.session_state['input_key'] = 0
+# [新增] 用來控制畫布重置的 Key
+if 'canvas_key' not in st.session_state:
+    st.session_state['canvas_key'] = "canvas_0"
 
 with st.sidebar:
     st.title("🎛️ 控制台")
@@ -300,6 +289,15 @@ if app_mode == "📷 攝影機模式 (Live)":
 
 elif app_mode == "🎨 手寫板模式":
     st.info("直接在下方書寫，放開滑鼠自動辨識。")
+    
+    # [新增] 清除按鈕
+    col_clear, col_dummy = st.columns([1, 5])
+    with col_clear:
+        if st.button("🗑️ 清除畫布"):
+            # 更新 Key，強制重置畫布
+            st.session_state['canvas_key'] = f"canvas_{time.time()}"
+            st.rerun()
+
     canvas_result = st_canvas(
         fill_color="rgba(255, 165, 0, 0.3)",
         stroke_width=15,
@@ -307,7 +305,8 @@ elif app_mode == "🎨 手寫板模式":
         background_color="#000000",
         height=300, width=600,
         drawing_mode="freedraw",
-        key="canvas",
+        # 使用動態 Key
+        key=st.session_state['canvas_key'],
     )
     
     if canvas_result.image_data is not None:
