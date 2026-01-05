@@ -219,11 +219,15 @@ class HandwriteProcessor(VideoProcessorBase):
 # --- 4. Streamlit 介面 ---
 st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", layout="wide")
 
+# [修改] 初始化統計變數 (分成兩個獨立的字典)
 if 'stats' not in st.session_state:
-    st.session_state['stats'] = {'total': 0, 'correct': 0}
+    st.session_state['stats'] = {
+        'camera': {'total': 0, 'correct': 0},
+        'handwriting': {'total': 0, 'correct': 0}
+    }
+    
 if 'input_key' not in st.session_state:
     st.session_state['input_key'] = 0
-# [新增] 用來控制畫布重置的 Key
 if 'canvas_key' not in st.session_state:
     st.session_state['canvas_key'] = "canvas_0"
 
@@ -231,14 +235,28 @@ with st.sidebar:
     st.title("🎛️ 控制台")
     app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式"])
     st.divider()
-    total = st.session_state['stats']['total']
-    correct = st.session_state['stats']['correct']
+    
+    # [修改] 根據模式顯示對應的統計數據
+    if app_mode == "📷 攝影機模式 (Live)":
+        current_stats = st.session_state['stats']['camera']
+        st.subheader("📷 鏡頭成績")
+    else:
+        current_stats = st.session_state['stats']['handwriting']
+        st.subheader("🎨 手寫成績")
+        
+    total = current_stats['total']
+    correct = current_stats['correct']
     acc = (correct / total * 100) if total > 0 else 0.0
+    
     st.metric("總數 (Total)", total)
     st.metric("正確 (Correct)", correct)
     st.metric("準確率", f"{acc:.1f}%")
-    if st.button("🔄 重置統計"):
-        st.session_state['stats'] = {'total': 0, 'correct': 0}
+    
+    if st.button("🔄 重置所有統計"):
+        st.session_state['stats'] = {
+            'camera': {'total': 0, 'correct': 0},
+            'handwriting': {'total': 0, 'correct': 0}
+        }
         st.rerun()
 
 st.title("📝 手寫數字辨識系統")
@@ -272,15 +290,15 @@ if app_mode == "📷 攝影機模式 (Live)":
         with c2:
             st.write("##") 
             if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
-                # 1. 先解除凍結
+                # 1. 解除凍結
                 if ctx.video_processor:
                     ctx.video_processor.resume()
                 
-                # 2. 存成績
+                # 2. 存成績 (存到 camera 分類)
                 if manual_score > 0:
-                    st.session_state['stats']['total'] += manual_score 
-                    st.session_state['stats']['correct'] += manual_score
-                    st.toast(f"✅ 已記錄 {manual_score} 筆！")
+                    st.session_state['stats']['camera']['total'] += manual_score 
+                    st.session_state['stats']['camera']['correct'] += manual_score
+                    st.toast(f"✅ 鏡頭模式：已記錄 {manual_score} 筆！")
                     time.sleep(0.5)
                     st.session_state['input_key'] += 1
                     
@@ -290,11 +308,9 @@ if app_mode == "📷 攝影機模式 (Live)":
 elif app_mode == "🎨 手寫板模式":
     st.info("直接在下方書寫，放開滑鼠自動辨識。")
     
-    # [新增] 清除按鈕
     col_clear, col_dummy = st.columns([1, 5])
     with col_clear:
         if st.button("🗑️ 清除畫布"):
-            # 更新 Key，強制重置畫布
             st.session_state['canvas_key'] = f"canvas_{time.time()}"
             st.rerun()
 
@@ -305,7 +321,6 @@ elif app_mode == "🎨 手寫板模式":
         background_color="#000000",
         height=300, width=600,
         drawing_mode="freedraw",
-        # 使用動態 Key
         key=st.session_state['canvas_key'],
     )
     
@@ -358,6 +373,9 @@ elif app_mode == "🎨 手寫板模式":
             with col2:
                 st.write("##")
                 if st.button("儲存成績", key="hw_save"):
-                    st.session_state['stats']['total'] += detected_count
-                    st.session_state['stats']['correct'] += hw_score
+                    # 存到 handwriting 分類
+                    st.session_state['stats']['handwriting']['total'] += detected_count
+                    st.session_state['stats']['handwriting']['correct'] += hw_score
+                    st.success("✅ 手寫模式：已儲存！")
+                    time.sleep(0.5)
                     st.rerun()
