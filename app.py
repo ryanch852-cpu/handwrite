@@ -8,89 +8,106 @@ from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 
-# 設定 TensorFlow
+# 設定 TensorFlow 日誌等級 (減少干擾)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 from tensorflow.keras.models import load_model
 
 # --- 參數設定 ---
 MIN_HEIGHT = 32
 MIN_AREA = 140
-SHRINK_PX = 4
-STABILITY_DURATION = 1.2
-MOVEMENT_THRESHOLD = 80
+SHRINK_PX = 4           # 綠框內縮像素 (視覺優化)
+STABILITY_DURATION = 1.2 # 穩定時間閾值 (秒)
+MOVEMENT_THRESHOLD = 80  # 像素位移容忍值 (抗手抖)
 
-# --- 1. 載入模型 ---
+# --- 1. 載入模型 (使用快取加速) ---
 @st.cache_resource
 def load_ai_model():
+    # 檢查檔案是否存在
     if os.path.exists("mnist_cnn.h5"):
         try:
             return load_model("mnist_cnn.h5")
-        except:
+        except Exception as e:
+            st.error(f"模型載入失敗: {e}")
             return None
     return None
 
 model = load_ai_model()
 
-# --- 2. 核心功能: 膚色過濾 ---
+# --- 2. 核心輔助函式: 膚色過濾 ---
 def is_valid_content(img_bgr):
+    """
+    過濾畫面中的皮膚顏色與高飽和度雜物。
+    回傳: True (保留), False (過濾)
+    """
     if img_bgr is None or img_bgr.size == 0: return False
+    
+    # 轉換到 HSV 色彩空間
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mean_h = np.mean(hsv[:,:,0])
-    mean_s = np.mean(hsv[:,:,1])
+    mean_h = np.mean(hsv[:,:,0]) # 色相
+    mean_s = np.mean(hsv[:,:,1]) # 飽和度
+    
+    # 1. 飽和度過高 (>60) -> 通常是彩色雜物
     if mean_s > 60: return False
+    
+    # 2. 飽和度中等 (30~60) 且色相偏紅/橘 -> 疑似皮膚
+    # 色相 0~25 (紅橘) 或 155~180 (紫紅)
     if 30 < mean_s <= 60:
         if (mean_h < 25 or mean_h > 155): return False
+        
     return True
 
-# --- 3. WebRTC 影像處理器 (鏡頭模式專用) ---
+# --- 3. WebRTC 影像處理器 (鏡頭模式核心) ---
 class HandwriteProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = model
-        self.last_boxes = []
-        self.stability_start_time = None
-        self.frozen = False       # 是否凍結中
-        self.frozen_frame = None  # 凍結的畫面
-        self.detected_count = 0   # 偵測到的數量
+        self.last_boxes = []          # 上一幀的框框位置 (算穩定度用)
+        self.stability_start_time = None 
+        self.frozen = False           # 是否處於凍結狀態
+        self.frozen_frame = None      # 凍結時的畫面
+        self.detected_count = 0       # 當前偵測到的數字數量
 
-    # 外部呼叫此函式來解除凍結
+    # 解除凍結 (由外部按鈕呼叫)
     def resume(self):
         self.frozen = False
         self.stability_start_time = None
         self.last_boxes = []
 
     def recv(self, frame):
+        # 將 WebRTC 影像轉為 OpenCV 格式 (BGR)
         img = frame.to_ndarray(format="bgr24")
         
-        # [狀態 A] 如果凍結中，永遠回傳同一張圖，直到被叫醒
-        if self.frozen:
+        # [狀態 A] 凍結中：回傳同一張靜止畫面
+        if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
         
-        # [狀態 B] Live 偵測模式
+        # [狀態 B] Live 偵測中
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        # 1. 繪製藍色 ROI 框
+        # 1. 定義 ROI (藍色框) - 畫面縮進 10 pixel
         roi_rect = [10, 10, w_f - 20, h_f - 20]
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
         
-        # 2. 影像前處理
+        # 2. 影像前處理 (ROI 切割 -> 灰階 -> 模糊 -> 二值化 -> 膨脹)
         roi_img = img[roi_rect[1]:roi_rect[1]+roi_rect[3], roi_rect[0]:roi_rect[0]+roi_rect[2]]
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 18)
         binary_proc = cv2.dilate(thresh, None, iterations=2)
         
-        # 3. 找輪廓
+        # 3. 尋找輪廓
         contours, hierarchy = cv2.findContours(binary_proc, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         
         valid_boxes = []
         if hierarchy is not None:
             for i, cnt in enumerate(contours):
+                # hierarchy[i][3] == -1 表示最外層輪廓 (不是孔洞)
                 if hierarchy[0][i][3] == -1:
                     area = cv2.contourArea(cnt)
                     if area > MIN_AREA:
                         x, y, w, h = cv2.boundingRect(cnt)
+                        # 檢查是否有子輪廓 (孔洞)
                         has_hole = hierarchy[0][i][2] != -1
                         valid_boxes.append({
                             "box": (x, y, w, h), 
@@ -98,33 +115,43 @@ class HandwriteProcessor(VideoProcessorBase):
                             "aspect_ratio": w / float(h)
                         })
         
+        # 由左至右排序
         valid_boxes = sorted(valid_boxes, key=lambda b: b["box"][0])
         
-        # 4. 批量預測
+        # 4. 準備批量預測 (Batch Inference)
         batch_rois = []
         batch_info = []
-        raw_boxes_for_stability = [] 
+        raw_boxes_for_stability = [] # 用來計算穩定度的原始框
         
         for item in valid_boxes:
             x, y, w, h = item["box"]
+            # 轉換回全域座標
             rx, ry = x + roi_rect[0], y + roi_rect[1]
             
-            if x < 15 or y < 15 or (x+w) > binary_proc.shape[1]-15 or (y+h) > binary_proc.shape[0]-15: continue
-            if h < MIN_HEIGHT: continue
+            # [過濾 1] 邊緣過濾
+            if x < 15 or y < 15 or (x+w) > binary_proc.shape[1]-15 or (y+h) > binary_proc.shape[0]-15: 
+                continue
+            if h < MIN_HEIGHT: 
+                continue
             
+            # [過濾 2] 膚色過濾 (在原圖上切)
             roi_color = display_img[ry:ry+h, rx:rx+w]
-            if not is_valid_content(roi_color): continue
+            if not is_valid_content(roi_color): 
+                continue
             
             raw_boxes_for_stability.append(item)
             
+            # [CNN 預處理] Padding 補黑邊 -> Resize 28x28 -> Normalize
             roi_single = binary_proc[y:y+h, x:x+w]
             side = max(w, h)
             padding = int(side * 0.2)
             container_size = side + padding * 2
             container = np.zeros((container_size, container_size), dtype=np.uint8)
+            
             offset_y = (container_size - h) // 2
             offset_x = (container_size - w) // 2
             container[offset_y:offset_y+h, offset_x:offset_x+w] = roi_single
+            
             roi_resized = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
             roi_norm = roi_resized.astype('float32') / 255.0
             roi_ready = roi_norm.reshape(28, 28, 1)
@@ -139,10 +166,11 @@ class HandwriteProcessor(VideoProcessorBase):
         detected_count = 0
         detected_something = False
         
+        # 5. 執行 CNN 預測與混合修正
         if len(batch_rois) > 0 and self.model is not None:
             detected_something = True
-            batch_input = np.stack(batch_rois)
             try:
+                batch_input = np.stack(batch_rois)
                 predictions = self.model.predict(batch_input, verbose=0)
                 
                 for i, pred in enumerate(predictions):
@@ -153,14 +181,18 @@ class HandwriteProcessor(VideoProcessorBase):
                     has_hole = info["has_hole"]
                     aspect = info["aspect"]
                     
+                    # === 混合修正邏輯 (Hybrid Rules) ===
                     if res_id == 1:
                         if aspect > 0.45: res_id = 7
                     elif res_id == 7:
                         if aspect < 0.25: res_id = 1
+                    
                     if res_id == 7 and has_hole: res_id = 9
                     if res_id == 9 and not has_hole and confidence < 0.95: res_id = 7
                     if res_id == 0 and aspect < 0.5: res_id = 1
+                    # ==================================
                     
+                    # 繪製結果 (綠框內縮 4px)
                     draw_x = rx + SHRINK_PX
                     draw_y = ry + SHRINK_PX
                     draw_w = max(1, w - (SHRINK_PX * 2))
@@ -169,12 +201,13 @@ class HandwriteProcessor(VideoProcessorBase):
                     cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), (0, 255, 0), 2)
                     cv2.putText(display_img, str(res_id), (rx, ry-8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     detected_count += 1
-            except:
-                pass
+            except Exception as e:
+                print(f"Prediction Error: {e}")
 
         self.detected_count = detected_count
 
-        # 5. 穩定度偵測
+        # 6. 穩定度偵測與自動抓拍
+        # 比較當前框框與上一幀的位移
         if len(raw_boxes_for_stability) == 0:
             self.stability_start_time = None
         elif len(self.last_boxes) == 0:
@@ -182,6 +215,7 @@ class HandwriteProcessor(VideoProcessorBase):
             self.stability_start_time = time.time()
         else:
             total_movement = 0
+            # 簡易位移計算
             for curr_box in raw_boxes_for_stability:
                 c_x, c_y, c_w, c_h = curr_box["box"]
                 min_dist = 99999
@@ -192,41 +226,42 @@ class HandwriteProcessor(VideoProcessorBase):
                 if min_dist < 30: total_movement += min_dist
                 else: total_movement += 20 
             
+            # 懲罰數量變動
             count_diff = abs(len(raw_boxes_for_stability) - len(self.last_boxes))
             total_movement += count_diff * 30 
             self.last_boxes = raw_boxes_for_stability
 
+            # 判斷穩定
             if total_movement < MOVEMENT_THRESHOLD:
                 if self.stability_start_time is None: self.stability_start_time = time.time()
                 elapsed = time.time() - self.stability_start_time
                 progress = min(elapsed / STABILITY_DURATION, 1.0)
                 
-                # 畫進度條
+                # 繪製下方進度條
                 bar_w = int(600 * progress)
                 color = (0, 255, 255) if progress < 1.0 else (0, 255, 0)
                 cv2.rectangle(display_img, (20, h_f - 40), (20 + bar_w, h_f - 25), color, -1)
                 cv2.rectangle(display_img, (20, h_f - 40), (620, h_f - 25), (255, 255, 255), 2)
                 
-                # [關鍵修改] 穩定後 -> 凍結 -> 等待手動解除
+                # [觸發凍結] 穩定時間到且有偵測到東西
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
-                    # 在畫面上印出等待訊息
                     cv2.putText(display_img, "CAPTURED! Waiting for Input...", (20, 60), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-                    self.frozen_frame = display_img.copy()
+                    self.frozen_frame = display_img.copy() # 存下畫面
             else:
                 self.stability_start_time = time.time()
 
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
-# --- 4. Streamlit 介面 ---
+# --- 4. Streamlit 介面配置 ---
 st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", layout="wide")
 
-# 初始化統計
+# 初始化統計變數
 if 'stats' not in st.session_state:
     st.session_state['stats'] = {'total': 0, 'correct': 0}
 
-# 側邊欄
+# --- 側邊欄 ---
 with st.sidebar:
     st.title("🎛️ 控制台")
     app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式"])
@@ -243,58 +278,63 @@ with st.sidebar:
         st.session_state['stats'] = {'total': 0, 'correct': 0}
         st.rerun()
 
+# --- 主畫面 ---
 st.title("📝 手寫數字辨識系統")
 
 if model is None:
-    st.error("❌ 找不到 `mnist_cnn.h5`！")
+    st.error("❌ 找不到 `mnist_cnn.h5`！請確認檔案已上傳。")
     st.stop()
 
-# --- 5. 模式處理 ---
+# --- 5. 模式分支 ---
 
 # [模式 A] 攝影機 Live 模式
 if app_mode == "📷 攝影機模式 (Live)":
     st.info("💡 手持紙張保持穩定，進度條滿後會**自動凍結**，等你按「繼續」才會解鎖。")
     
-    # 建立 WebRTC 串流
-    ctx = webrtc_streamer(
-        key="handwrite-live",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=HandwriteProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        async_processing=True,
-    )
+    # 使用 columns 縮小畫面寬度 (提升畫質與視覺體驗)
+    col_spacer1, col_cam, col_spacer2 = st.columns([1, 3, 1])
 
-    # 控制按鈕區
-    col1, col2 = st.columns([1, 1])
-    
-    # 手動紀錄按鈕
-    with col1:
-        manual_score = st.number_input("✍️ 輸入正確數量 (Input Score)", min_value=0, value=0)
-    
-    with col2:
-        st.write("##") # 排版
-        # 這個按鈕做兩件事：1. 存成績 2. 解除凍結
-        if st.button("💾 儲存並繼續 (Save & Resume)", type="primary"):
-            # 1. 存成績
-            if manual_score > 0:
-                # 這裡我們無法精確知道 detected_count，只能用使用者輸入的
-                # 因為 WebRTC 是異步的，很難即時把 count 傳回來
-                # 假設 total = score (或依使用者輸入)
-                st.session_state['stats']['total'] += manual_score 
-                st.session_state['stats']['correct'] += manual_score
-                st.success(f"已記錄 {manual_score} 筆資料！")
-                time.sleep(0.5)
-                st.rerun()
-            
-            # 2. 解除凍結 (關鍵！)
-            if ctx.video_processor:
-                ctx.video_processor.resume()
+    with col_cam:
+        # 啟動 WebRTC
+        ctx = webrtc_streamer(
+            key="handwrite-live",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=HandwriteProcessor,
+            media_stream_constraints={
+                "video": {"width": 1280, "height": 720}, # 強制 HD
+                "audio": False
+            },
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            async_processing=True,
+        )
 
-# [模式 B] 手寫板模式 (你的舊愛)
+        # 控制區
+        c1, c2 = st.columns([1, 1])
+        
+        with c1:
+            manual_score = st.number_input("✍️ 輸入正確數量 (Input Score)", min_value=0, value=0)
+        
+        with c2:
+            st.write("##") 
+            # 這個按鈕負責「存檔」和「解鎖」
+            if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
+                # 1. 存成績
+                if manual_score > 0:
+                    st.session_state['stats']['total'] += manual_score 
+                    st.session_state['stats']['correct'] += manual_score
+                    st.toast(f"✅ 已記錄 {manual_score} 筆資料！") # 右下角小提示
+                    time.sleep(0.5)
+                    st.rerun() # 更新側邊欄
+                
+                # 2. 解除凍結 (呼叫 Processor 裡的 resume)
+                if ctx.video_processor:
+                    ctx.video_processor.resume()
+
+# [模式 B] 手寫板模式
 elif app_mode == "🎨 手寫板模式":
     st.info("直接在下方書寫，放開滑鼠自動辨識。")
     
+    # 建立畫布
     canvas_result = st_canvas(
         fill_color="rgba(255, 165, 0, 0.3)",
         stroke_width=15,
@@ -306,13 +346,16 @@ elif app_mode == "🎨 手寫板模式":
         key="canvas",
     )
     
+    # 畫布即時處理
     if canvas_result.image_data is not None:
         img_data = canvas_result.image_data.astype(np.uint8)
+        
+        # 只有當畫布不為全黑時才處理
         if np.max(img_data) > 0:
-            # 簡單辨識邏輯 (與 Live 模式共用部分代碼太冗長，這裡簡化重寫核心)
             if img_data.shape[2] == 4:
                 img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
             
+            # 前處理 (簡化版)
             gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
             binary_proc = cv2.dilate(gray, None, iterations=1)
             _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
@@ -329,8 +372,9 @@ elif app_mode == "🎨 手寫板模式":
             for cnt in contours:
                 if cv2.contourArea(cnt) > MIN_AREA:
                     x, y, w, h = cv2.boundingRect(cnt)
-                    # Preprocessing
                     roi = binary_proc[y:y+h, x:x+w]
+                    
+                    # Padding
                     side = max(w, h)
                     pad = int(side * 0.2)
                     container = np.zeros((side+pad*2, side+pad*2), dtype=np.uint8)
@@ -343,13 +387,14 @@ elif app_mode == "🎨 手寫板模式":
                     batch_rois.append(roi_ready)
                     batch_coords.append((x, y, w, h))
             
+            # 預測
             if len(batch_rois) > 0:
                 preds = model.predict(np.stack(batch_rois), verbose=0)
                 for i, pred in enumerate(preds):
                     res_id = np.argmax(pred)
                     x, y, w, h = batch_coords[i]
                     
-                    # 簡單修正 (手寫板環境單純，規則可以少一點)
+                    # 簡單修正
                     asp = w/h
                     if res_id==1 and asp>0.5: res_id=7
                     if res_id==7 and asp<0.3: res_id=1
@@ -359,9 +404,8 @@ elif app_mode == "🎨 手寫板模式":
                     detected_count += 1
             
             st.image(draw_img, channels="BGR")
-            st.success(f"偵測到 {detected_count} 個數字")
             
-            # 手寫板成績輸入
+            # 成績輸入
             col1, col2 = st.columns([1,1])
             with col1:
                 hw_score = st.number_input("輸入數量", min_value=0, value=detected_count, key="hw_input")
@@ -370,4 +414,6 @@ elif app_mode == "🎨 手寫板模式":
                 if st.button("儲存成績", key="hw_save"):
                     st.session_state['stats']['total'] += detected_count
                     st.session_state['stats']['correct'] += hw_score
+                    st.success("已儲存！")
+                    time.sleep(0.5)
                     st.rerun()
