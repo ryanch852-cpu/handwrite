@@ -265,7 +265,7 @@ with st.sidebar:
 
 st.title("📝 手寫數字辨識系統")
 
-# 操作說明
+# [新增] 操作說明 (折疊式)
 with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
     st.markdown("""
     #### 1. 📷 攝影機模式 (Live)
@@ -310,7 +310,7 @@ if app_mode == "📷 攝影機模式 (Live)":
         with c2:
             st.write("##") 
             if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
-                # 1. 解除凍結
+                # 1. 先解除凍結
                 if ctx.video_processor:
                     ctx.video_processor.resume()
                 
@@ -326,17 +326,14 @@ if app_mode == "📷 攝影機模式 (Live)":
                 st.rerun()
 
 elif app_mode == "🎨 手寫板模式":
-    st.info("直接在下方書寫，放開滑鼠自動辨識。")
     
-    # [修改] 使用左右分欄佈局 (左3 : 右1)
-    col_canvas, col_result = st.columns([3, 1])
+    c_left, c_right = st.columns([7, 3])
 
-    with col_canvas:
+    with c_left:
         if st.button("🗑️ 清除畫布"):
             st.session_state['canvas_key'] = f"canvas_{time.time()}"
             st.rerun()
 
-        # [修改] 畫布加寬加高
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
             stroke_width=15,
@@ -348,8 +345,7 @@ elif app_mode == "🎨 手寫板模式":
             key=st.session_state['canvas_key'],
         )
 
-    # 右側結果區
-    with col_result:
+    with c_right:
         st.markdown("### 👁️ 結果")
         
         if canvas_result.image_data is not None:
@@ -396,7 +392,6 @@ elif app_mode == "🎨 手寫板模式":
                         cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                         detected_count += 1
                 
-                # 顯示結果縮圖
                 st.image(draw_img, channels="BGR", use_container_width=True)
                 
                 if detected_count > 0:
