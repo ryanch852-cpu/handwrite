@@ -19,6 +19,10 @@ SHRINK_PX = 4
 STABILITY_DURATION = 1.2
 MOVEMENT_THRESHOLD = 80
 
+# [視覺設定]
+ROI_MARGIN = 60  # 藍框邊距 (數字越大，框越小)
+TEXT_Y_OFFSET = 15 # 文字與藍框的距離
+
 # --- 1. 載入模型 ---
 @st.cache_resource
 def load_ai_model():
@@ -69,13 +73,19 @@ class HandwriteProcessor(VideoProcessorBase):
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        # 繪製藍色 ROI 框
-        roi_rect = [10, 10, w_f - 20, h_f - 20]
+        # [修改] 1. 繪製藍色 ROI 框 (更小)
+        # ROI_MARGIN = 60，代表上下左右都空出 60 像素，框就變小了
+        roi_rect = [ROI_MARGIN, ROI_MARGIN, w_f - 2*ROI_MARGIN, h_f - 2*ROI_MARGIN]
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
         
-        # 影像前處理
+        # 影像前處理 (只處理框內)
         roi_img = img[roi_rect[1]:roi_rect[1]+roi_rect[3], roi_rect[0]:roi_rect[0]+roi_rect[2]]
+        
+        # 防呆：如果框太小導致沒有影像
+        if roi_img.size == 0:
+             return av.VideoFrame.from_ndarray(display_img, format="bgr24")
+
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 18)
@@ -107,9 +117,11 @@ class HandwriteProcessor(VideoProcessorBase):
         
         for item in valid_boxes:
             x, y, w, h = item["box"]
+            # 座標轉換：因為是在 ROI 裡找到的，要加回 ROI 的起始點
             rx, ry = x + roi_rect[0], y + roi_rect[1]
             
-            if x < 15 or y < 15 or (x+w) > binary_proc.shape[1]-15 or (y+h) > binary_proc.shape[0]-15: continue
+            # 過濾邏輯 (基於 ROI 內的小圖)
+            if x < 5 or y < 5 or (x+w) > binary_proc.shape[1]-5 or (y+h) > binary_proc.shape[0]-5: continue
             if h < MIN_HEIGHT: continue
             
             roi_color = display_img[ry:ry+h, rx:rx+w]
@@ -207,8 +219,11 @@ class HandwriteProcessor(VideoProcessorBase):
                 
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
-                    cv2.putText(display_img, "CAPTURED! Waiting for Input...", (20, 60), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                    # [修改] 2. 將 CAPTURED 文字移到藍框上方
+                    # 藍框的頂部是 ROI_MARGIN (60)，文字放在 60 - 15 = 45 的位置
+                    text_y = max(30, ROI_MARGIN - TEXT_Y_OFFSET) 
+                    cv2.putText(display_img, "CAPTURED! Waiting for Input...", (ROI_MARGIN, text_y), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     self.frozen_frame = display_img.copy()
             else:
                 self.stability_start_time = time.time()
@@ -220,7 +235,6 @@ st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", 
 
 if 'stats' not in st.session_state:
     st.session_state['stats'] = {'total': 0, 'correct': 0}
-# [新增] 用來重置輸入框的 key
 if 'input_key' not in st.session_state:
     st.session_state['input_key'] = 0
 
@@ -264,13 +278,12 @@ if app_mode == "📷 攝影機模式 (Live)":
         c1, c2 = st.columns([1, 1])
         
         with c1:
-            # 使用 session_state key 來控制重置
             manual_score = st.number_input("✍️ 輸入正確數量", min_value=0, value=0, key=f"score_input_{st.session_state['input_key']}")
         
         with c2:
             st.write("##") 
             if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
-                # 1. 先解除凍結 (這行一定要在 rerun 之前！)
+                # 1. 先解除凍結
                 if ctx.video_processor:
                     ctx.video_processor.resume()
                 
@@ -280,11 +293,9 @@ if app_mode == "📷 攝影機模式 (Live)":
                     st.session_state['stats']['correct'] += manual_score
                     st.toast(f"✅ 已記錄 {manual_score} 筆！")
                     time.sleep(0.5)
-                    
-                    # 更新 key 以重置輸入框
                     st.session_state['input_key'] += 1
                     
-                # 3. 最後才重整 (更新側邊欄)
+                # 3. 重整
                 st.rerun()
 
 elif app_mode == "🎨 手寫板模式":
