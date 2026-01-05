@@ -3,3 +3,6 @@ tensorflow-cpu
 opencv-python-headless
 numpy
 pillow
+streamlit-webrtc
+streamlit-drawable-canvas
+av
