@@ -224,7 +224,6 @@ if 'stats' not in st.session_state:
         'camera': {'total': 0, 'correct': 0},
         'handwriting': {'total': 0, 'correct': 0}
     }
-    
 if 'input_key' not in st.session_state:
     st.session_state['input_key'] = 0
 if 'canvas_key' not in st.session_state:
@@ -235,14 +234,11 @@ with st.sidebar:
     app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式"])
     st.divider()
     
-    # [修改] 同時顯示兩邊的成績
-    
-    # 1. 鏡頭成績區
+    # 鏡頭成績
     st.markdown("### 📷 鏡頭成績")
     c_total = st.session_state['stats']['camera']['total']
     c_correct = st.session_state['stats']['camera']['correct']
     c_acc = (c_correct / c_total * 100) if c_total > 0 else 0.0
-    
     col_c1, col_c2 = st.columns(2)
     with col_c1: st.metric("總數", c_total)
     with col_c2: st.metric("正確", c_correct)
@@ -250,12 +246,11 @@ with st.sidebar:
 
     st.divider()
 
-    # 2. 手寫成績區
+    # 手寫成績
     st.markdown("### 🎨 手寫成績")
     h_total = st.session_state['stats']['handwriting']['total']
     h_correct = st.session_state['stats']['handwriting']['correct']
     h_acc = (h_correct / h_total * 100) if h_total > 0 else 0.0
-
     col_h1, col_h2 = st.columns(2)
     with col_h1: st.metric("總數", h_total)
     with col_h2: st.metric("正確", h_correct)
@@ -301,11 +296,11 @@ if app_mode == "📷 攝影機模式 (Live)":
         with c2:
             st.write("##") 
             if st.button("💾 儲存並繼續 (Save & Resume)", type="primary", use_container_width=True):
-                # 1. 先解除凍結
+                # 1. 解除凍結
                 if ctx.video_processor:
                     ctx.video_processor.resume()
                 
-                # 2. 存成績 (存到 camera 分類)
+                # 2. 存成績
                 if manual_score > 0:
                     st.session_state['stats']['camera']['total'] += manual_score 
                     st.session_state['stats']['camera']['correct'] += manual_score
@@ -319,74 +314,93 @@ if app_mode == "📷 攝影機模式 (Live)":
 elif app_mode == "🎨 手寫板模式":
     st.info("直接在下方書寫，放開滑鼠自動辨識。")
     
-    col_clear, col_dummy = st.columns([1, 5])
-    with col_clear:
+    # [修改] 使用左右佈局：左邊畫畫 (70%)，右邊結果與控制 (30%)
+    c_left, c_right = st.columns([7, 3])
+
+    with c_left:
+        # 清除按鈕放在畫布上方
         if st.button("🗑️ 清除畫布"):
             st.session_state['canvas_key'] = f"canvas_{time.time()}"
             st.rerun()
 
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.3)",
-        stroke_width=15,
-        stroke_color="#FFFFFF",
-        background_color="#000000",
-        height=300, width=600,
-        drawing_mode="freedraw",
-        key=st.session_state['canvas_key'],
-    )
-    
-    if canvas_result.image_data is not None:
-        img_data = canvas_result.image_data.astype(np.uint8)
-        if np.max(img_data) > 0:
-            if img_data.shape[2] == 4:
-                img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
-            gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
-            binary_proc = cv2.dilate(gray, None, iterations=1)
-            _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
-            contours, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
-            draw_img = img_data.copy()
+        # 手寫板 (寬度加長到 800)
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 165, 0, 0.3)",
+            stroke_width=15,
+            stroke_color="#FFFFFF",
+            background_color="#000000",
+            height=350, 
+            width=800,  # [修改] 加寬
+            drawing_mode="freedraw",
+            key=st.session_state['canvas_key'],
+        )
+
+    # 右邊顯示結果與輸入框
+    with c_right:
+        st.write("### 👁️ 辨識結果")
+        
+        if canvas_result.image_data is not None:
+            img_data = canvas_result.image_data.astype(np.uint8)
             detected_count = 0
-            batch_rois = []
-            batch_coords = []
             
-            for cnt in contours:
-                if cv2.contourArea(cnt) > MIN_AREA:
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    roi = binary_proc[y:y+h, x:x+w]
-                    side = max(w, h)
-                    pad = int(side * 0.2)
-                    container = np.zeros((side+pad*2, side+pad*2), dtype=np.uint8)
-                    ox, oy = (side+pad*2-w)//2, (side+pad*2-h)//2
-                    container[oy:oy+h, ox:ox+w] = roi
-                    roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
-                    roi_ready = roi_ready.astype('float32') / 255.0
-                    roi_ready = roi_ready.reshape(28, 28, 1)
-                    batch_rois.append(roi_ready)
-                    batch_coords.append((x, y, w, h))
-            
-            if len(batch_rois) > 0:
-                preds = model.predict(np.stack(batch_rois), verbose=0)
-                for i, pred in enumerate(preds):
-                    res_id = np.argmax(pred)
-                    x, y, w, h = batch_coords[i]
-                    asp = w/h
-                    if res_id==1 and asp>0.5: res_id=7
-                    if res_id==7 and asp<0.3: res_id=1
-                    cv2.rectangle(draw_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                    detected_count += 1
-            
-            st.image(draw_img, channels="BGR")
-            col1, col2 = st.columns([1,1])
-            with col1:
-                hw_score = st.number_input("輸入數量", min_value=0, value=detected_count, key="hw_input")
-            with col2:
+            if np.max(img_data) > 0:
+                if img_data.shape[2] == 4:
+                    img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
+                gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
+                binary_proc = cv2.dilate(gray, None, iterations=1)
+                _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
+                contours, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
+                draw_img = img_data.copy()
+                
+                batch_rois = []
+                batch_coords = []
+                
+                for cnt in contours:
+                    if cv2.contourArea(cnt) > MIN_AREA:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        roi = binary_proc[y:y+h, x:x+w]
+                        side = max(w, h)
+                        pad = int(side * 0.2)
+                        container = np.zeros((side+pad*2, side+pad*2), dtype=np.uint8)
+                        ox, oy = (side+pad*2-w)//2, (side+pad*2-h)//2
+                        container[oy:oy+h, ox:ox+w] = roi
+                        roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
+                        roi_ready = roi_ready.astype('float32') / 255.0
+                        roi_ready = roi_ready.reshape(28, 28, 1)
+                        batch_rois.append(roi_ready)
+                        batch_coords.append((x, y, w, h))
+                
+                if len(batch_rois) > 0:
+                    preds = model.predict(np.stack(batch_rois), verbose=0)
+                    for i, pred in enumerate(preds):
+                        res_id = np.argmax(pred)
+                        x, y, w, h = batch_coords[i]
+                        asp = w/h
+                        if res_id==1 and asp>0.5: res_id=7
+                        if res_id==7 and asp<0.3: res_id=1
+                        cv2.rectangle(draw_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        detected_count += 1
+                
+                # 顯示辨識後的縮圖
+                st.image(draw_img, channels="BGR", use_container_width=True)
+                
+                if detected_count > 0:
+                    st.success(f"偵測數: {detected_count}")
+                else:
+                    st.warning("未偵測到數字")
+
+                st.write("---")
+                # 輸入與儲存
+                hw_score = st.number_input("✍️ 正確數量", min_value=0, value=detected_count, key="hw_input")
+                
                 st.write("##")
-                if st.button("儲存成績", key="hw_save"):
-                    # 存到 handwriting 分類
+                if st.button("💾 儲存手寫成績", key="hw_save", type="primary"):
                     st.session_state['stats']['handwriting']['total'] += detected_count
                     st.session_state['stats']['handwriting']['correct'] += hw_score
-                    st.success("✅ 手寫模式：已儲存！")
+                    st.toast("✅ 手寫成績已儲存！")
                     time.sleep(0.5)
                     st.rerun()
+            else:
+                st.info("請在左側畫布書寫...")
