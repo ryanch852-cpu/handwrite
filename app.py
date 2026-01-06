@@ -313,7 +313,7 @@ class HandwriteProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
 # --- 4. Streamlit 介面 ---
-st.set_page_config(page_title="手寫辨識 (Web 終極版)", page_icon="📝", layout="wide")
+st.set_page_config(page_title="手寫辨識", page_icon="📝", layout="wide")
 
 # 初始化 session_state
 if 'stats' not in st.session_state:
@@ -433,12 +433,13 @@ st.title("📝 手寫數字辨識系統")
 with st.expander("📖 系統操作說明 (點擊展開)，很重要記得看", expanded=False):
     st.markdown(f"""
     #### ⚠️ 提高準確率的技巧：
-    1. **請將紙張拿近鏡頭**，盡量拿奇異筆寫，筆跡太細或數字太小 (距離太遠)，可能會被系統忽略。
-    2. **數字1不要畫底線！** (底線會被當成數字的一部分，導致誤判)
-    3. **數字盡量寫正**，太歪的會判定失準。
-    4. **成績的部分**，正確/總數為準確度，與信心度無關，方便統計用，記得按上傳成績才會更新。
-    5. **用手機使用時**，鏡頭模式可能會卡，盡量用電腦使用
-    6. **鏡頭權限記得開**
+    1. 請將紙張拿近鏡頭，盡量拿奇異筆寫，筆跡太細或數字太小 (距離太遠)，可能會被系統忽略。
+    2. 數字**1**不要畫底線！ (底線會被當成數字的一部分，導致誤判)
+    3. 數字盡量寫正，太歪的會判定失準。
+    4. 成績的部分，正確/總數為準確度，與信心度無關，方便統計用，記得按上傳成績才會更新。
+    5. 用手機使用時，鏡頭模式可能會卡，盡量用電腦使用
+    6. 鏡頭權限記得開
+    7. 圖片上傳模式拍照或截圖內盡量只留下數字
     > **注意**：系統設定信心度低於 **{int(CONFIDENCE_THRESHOLD*100)}%** 的結果將不會顯示。
     """)
 
