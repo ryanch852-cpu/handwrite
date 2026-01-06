@@ -106,6 +106,7 @@ def update_tracker(contours):
     return current_items
 
 # --- 3. WebRTC 影像處理器 ---
+# --- 3. WebRTC 影像處理器 (優化版) ---
 class HandwriteProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = model
@@ -115,12 +116,19 @@ class HandwriteProcessor(VideoProcessorBase):
         self.frozen_frame = None  
         self.detected_count = 0   
         self.ui_results = [] 
+        
+        # [新增] 用於跳幀處理
+        self.frame_counter = 0
+        self.skip_rate = 4  # 每 4 幀才處理一次 AI (數字越大越順暢，但即時性稍降)
+        self.last_display_img = None # 緩存上一張處理好的畫面 (或者只緩存框的位置)
+        self.cached_rois = [] # 緩存上一幀的框位置
 
     def resume(self):
         self.frozen = False
         self.stability_start_time = None
         self.last_boxes = []
         self.ui_results = [] 
+        self.frame_counter = 0
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -128,18 +136,33 @@ class HandwriteProcessor(VideoProcessorBase):
         if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
         
+        # 複製影像用於繪圖
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
+        # 繪製 ROI 藍框 (這是靜態的，每幀都要畫)
         roi_rect = [ROI_MARGIN_X, ROI_MARGIN_Y, w_f - 2*ROI_MARGIN_X, h_f - 2*ROI_MARGIN_Y]
-        
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
+
+        # --- [關鍵優化] 跳幀邏輯 ---
+        self.frame_counter += 1
+        process_this_frame = (self.frame_counter % self.skip_rate == 0)
+
+        # 如果不處理這一幀，我們直接把"上一次計算好的框"畫上去，節省 CPU 與時間
+        if not process_this_frame and len(self.cached_rois) > 0:
+            for (dx, dy, dw, dh, txt) in self.cached_rois:
+                cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), (0, 255, 0), 2)
+                cv2.putText(display_img, txt, (dx, dy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # 直接回傳，不做 OpenCV 運算
+            return av.VideoFrame.from_ndarray(display_img, format="bgr24")
+        
+        # ---------------------------
+        # 以下是原本的影像處理邏輯 (只有當 process_this_frame == True 才執行)
+        # ---------------------------
         
         roi_img = img[roi_rect[1]:roi_rect[1]+roi_rect[3], roi_rect[0]:roi_rect[0]+roi_rect[2]]
-        
-        if roi_img.size == 0:
-             return av.VideoFrame.from_ndarray(display_img, format="bgr24")
+        if roi_img.size == 0: return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -153,7 +176,6 @@ class HandwriteProcessor(VideoProcessorBase):
             for i, cnt in enumerate(contours):
                 if hierarchy[0][i][3] == -1:
                     area = cv2.contourArea(cnt)
-                    # [距離過濾] 面積過小則忽略
                     if area > MIN_AREA:
                         x, y, w, h = cv2.boundingRect(cnt)
                         has_hole = hierarchy[0][i][2] != -1
@@ -169,13 +191,14 @@ class HandwriteProcessor(VideoProcessorBase):
         batch_info = []
         raw_boxes_for_stability = [] 
         
+        # 清空緩存，準備更新
+        self.cached_rois = []
+
         for item in valid_boxes:
             x, y, w, h = item["box"]
             rx, ry = x + roi_rect[0], y + roi_rect[1]
             
             if x < 5 or y < 5 or (x+w) > binary_proc.shape[1]-5 or (y+h) > binary_proc.shape[0]-5: continue
-            
-            # [距離過濾] 高度過小則忽略
             if h < MIN_HEIGHT: continue
             
             roi_color = display_img[ry:ry+h, rx:rx+w]
@@ -184,9 +207,7 @@ class HandwriteProcessor(VideoProcessorBase):
             raw_boxes_for_stability.append(item)
             
             roi_single = binary_proc[y:y+h, x:x+w]
-            
-            # [Auto Deskew]
-            roi_single = deskew(roi_single)
+            roi_single = deskew(roi_single) # Auto Deskew
 
             side = max(w, h)
             padding = int(side * 0.2)
@@ -197,7 +218,6 @@ class HandwriteProcessor(VideoProcessorBase):
             
             roi_single = cv2.resize(roi_single, (w, h)) 
             container[offset_y:offset_y+h, offset_x:offset_x+w] = roi_single
-            
             roi_resized = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
             
             roi_norm = roi_resized.astype('float32') / 255.0
@@ -225,15 +245,14 @@ class HandwriteProcessor(VideoProcessorBase):
                     res_id = top_indices[0]
                     confidence = pred[res_id]
                     
-                    # [過濾] 信心度不足則跳過
-                    if confidence < CONFIDENCE_THRESHOLD:
-                        continue 
+                    if confidence < CONFIDENCE_THRESHOLD: continue 
 
                     info = batch_info[i]
                     rx, ry, w, h = info["coords"]
                     has_hole = info["has_hole"]
                     aspect = info["aspect"]
                     
+                    # 邏輯判斷
                     if res_id == 1:
                         if aspect > 0.6: res_id = 7
                     elif res_id == 7:
@@ -247,13 +266,16 @@ class HandwriteProcessor(VideoProcessorBase):
                     draw_w = max(1, w - (SHRINK_PX * 2))
                     draw_h = max(1, h - (SHRINK_PX * 2))
                     
+                    # 畫框與文字
                     cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), (0, 255, 0), 2)
+                    text_label = f"#{i+1}"
+                    cv2.putText(display_img, text_label, (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     
-                    cv2.putText(display_img, f"#{i+1}", (rx, ry-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    # [新增] 將結果存入緩存，給下一幀(跳過的幀)使用
+                    self.cached_rois.append((draw_x, draw_y, draw_w, draw_h, text_label))
                     
+                    # 生成 UI 文字
                     info_text = f"**#{i+1}**: 數字 `{res_id}` (信心: {int(confidence*100)}%)"
-                    
                     if confidence < 1.0:
                         alt_id = top_indices[1]
                         alt_conf = pred[alt_id]
@@ -265,19 +287,26 @@ class HandwriteProcessor(VideoProcessorBase):
             except: pass
 
         self.detected_count = detected_count
+        # ... (以下 Stability 穩定性檢測代碼保持不變，因為這只需要座標比較，運算很快) ...
+        # 注意：你需要把 current_frame_text_results 更新給 self.ui_results
+        if detected_something:
+             self.ui_results = current_frame_text_results
 
+        # Stability 邏輯區塊 (簡略版，直接複製原有的即可，確保 last_boxes 有更新)
         if len(raw_boxes_for_stability) == 0:
             self.stability_start_time = None
         elif len(self.last_boxes) == 0:
             self.last_boxes = raw_boxes_for_stability
             self.stability_start_time = time.time()
         else:
+            # ... (保留原有的移動距離計算代碼) ...
+            # 計算 total_movement...
             total_movement = 0
             for curr_box in raw_boxes_for_stability:
-                c_x, c_y, c_w, c_h = curr_box["box"]
+                c_x, c_y, _, _ = curr_box["box"]
                 min_dist = 99999
                 for last_box in self.last_boxes:
-                    l_x, l_y, l_w, l_h = last_box["box"]
+                    l_x, l_y, _, _ = last_box["box"]
                     dist = abs(c_x - l_x) + abs(c_y - l_y)
                     if dist < min_dist: min_dist = dist
                 if min_dist < 30: total_movement += min_dist
@@ -295,23 +324,16 @@ class HandwriteProcessor(VideoProcessorBase):
                 bar_y = h_f - 20 
                 bar_w = int(600 * progress)
                 color = (0, 255, 255) if progress < 1.0 else (0, 255, 0)
-                
                 cv2.rectangle(display_img, (20, bar_y - 15), (20 + bar_w, bar_y), color, -1)
                 cv2.rectangle(display_img, (20, bar_y - 15), (w_f - 20, bar_y), (255, 255, 255), 2)
                 
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
-                    text_y = max(30, ROI_MARGIN_Y - TEXT_Y_OFFSET) 
-                    cv2.putText(display_img, "CAPTURED!", (ROI_MARGIN_X, text_y), 
-                                cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 255), 2)
-                    
                     self.frozen_frame = display_img.copy()
-                    self.ui_results = current_frame_text_results
             else:
                 self.stability_start_time = time.time()
 
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
-
 # --- 4. Streamlit 介面 ---
 st.set_page_config(page_title="手寫辨識", page_icon="📝", layout="wide")
 
@@ -434,7 +456,7 @@ with st.expander("📖 系統操作說明 (點擊展開)，很重要記得看", 
     st.markdown(f"""
     #### ⚠️ 提高準確率的技巧：
     1. 請將紙張拿近鏡頭，盡量拿奇異筆寫，筆跡太細或數字太小 (距離太遠)，可能會被系統忽略。
-    2. 數字**1**不要畫底線！ (底線會被當成數字的一部分，導致誤判)
+    2. 數字**1**不要畫底線！ (底線會被當成其他數字的一部分，導致誤判)
     3. 數字盡量寫正，太歪的會判定失準。
     4. 成績的部分，正確/總數為準確度，與信心度無關，方便統計用，記得按上傳成績才會更新。
     5. 用手機使用時，鏡頭模式可能會卡，盡量用電腦使用
@@ -449,6 +471,7 @@ if model is None:
 
 # --- 5. 模式分支 ---
 
+# --- 5. 模式分支 (修改處) ---
 if app_mode == "📷 攝影機模式 (Live)":
     
     col_cam, col_data = st.columns([2, 1])
@@ -458,7 +481,8 @@ if app_mode == "📷 攝影機模式 (Live)":
             key="handwrite-live",
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=HandwriteProcessor,
-            media_stream_constraints={"video": {"width": 1280, "height": 720}, "audio": False},
+            # [修改] 將解析度改為 640x480 (或甚至 480x360)，大幅降低手機發熱與延遲
+            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
             rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             async_processing=True,
         )
