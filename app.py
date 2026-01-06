@@ -14,7 +14,7 @@ from tensorflow.keras.models import load_model
 
 # --- 參數設定 ---
 # [距離控制] 數字必須夠大才辨識 (強制拿近)
-MIN_HEIGHT = 45       
+MIN_HEIGHT = 50       
 MIN_AREA = 500       
 
 SHRINK_PX = 4
@@ -459,7 +459,7 @@ with st.expander("📖 系統操作說明 (點擊展開)，很重要記得看", 
     2. 數字**1**不要畫底線！ (底線會被當成其他數字的一部分，導致誤判)
     3. 數字盡量寫正，太歪的會判定失準。
     4. 成績的部分，正確/總數為準確度，與信心度無關，方便統計用，記得按上傳成績才會更新。
-    5. 用手機使用時，鏡頭模式會因為伺服器處理速度問題會卡，盡量用電腦使用
+    5. 用手機使用時，鏡頭模式會因為伺服器處理速度問題可能會卡，盡量用電腦使用
     6. 鏡頭權限記得開
     7. 圖片上傳模式拍照或截圖內盡量只留下數字
     8. 鏡頭模式中顯示的只是序號，點選顯示詳情能得到該序號所判定得數字
@@ -545,8 +545,30 @@ if app_mode == "📷 攝影機模式 (Live)":
                     
                 st.rerun()
 
+# --- 修改處：手寫板模式邏輯 (文字區塊增加信心能量條) ---
 elif app_mode == "🎨 手寫板模式":
     
+    # [新增] 產生 HTML 進度條的輔助函式
+    # [修改] 產生 HTML 進度條的輔助函式 (縮短版)
+    def get_bar_html(confidence):
+        percent = min(int(confidence * 100), 100)
+        
+        # 決定顏色
+        if confidence > 0.95: color = "#2ecc71"    # 綠色
+        elif confidence > 0.85: color = "#f1c40f"  # 黃色
+        else: color = "#e74c3c"                    # 紅色
+        
+        # HTML 結構
+        # 修改重點：將原本的 style="flex-grow: 1; ..." 改為 style="width: 50%; ..."
+        return f"""
+        <div style="display: flex; align-items: center; margin-top: 4px;">
+            <div style="width: 50%; height: 8px; background-color: #444; border-radius: 4px; overflow: hidden;">
+                <div style="width: {percent}%; height: 100%; background-color: {color};"></div>
+            </div>
+            <span style="margin-left: 8px; font-size: 0.8em; color: {color};">{percent}%</span>
+        </div>
+        """
+
     c_left, c_right = st.columns([3, 1])
     current_results_list = []
     
@@ -566,6 +588,7 @@ elif app_mode == "🎨 手寫板模式":
             width=850,   
             drawing_mode="freedraw",
             key=st.session_state['canvas_key'],
+            display_toolbar=False,  # <--- 加上這行就能把左下角的按鈕拔掉 
         )
         
         if canvas_result.image_data is not None:
@@ -575,6 +598,7 @@ elif app_mode == "🎨 手寫板模式":
                 if img_data.shape[2] == 4:
                     img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
                 gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
+
                 binary_proc = cv2.dilate(gray, None, iterations=1)
                 _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -590,9 +614,7 @@ elif app_mode == "🎨 手寫板模式":
                     
                     if cv2.contourArea(cnt) > MIN_AREA:
                         roi = binary_proc[y:y+h, x:x+w]
-                        
-                        # [Auto Deskew]
-                        roi = deskew(roi)
+                        roi = deskew(roi) 
                         
                         side = max(w, h)
                         pad = int(side * 0.2)
@@ -603,7 +625,6 @@ elif app_mode == "🎨 手寫板模式":
                         container[oy:oy+h, ox:ox+w] = roi
                         
                         roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
-
                         roi_ready = roi_ready.astype('float32') / 255.0
                         roi_ready = roi_ready.reshape(28, 28, 1)
                         batch_rois.append(roi_ready)
@@ -626,26 +647,33 @@ elif app_mode == "🎨 手寫板模式":
 
                         x, y, w, h = cv2.boundingRect(cnt)
                         asp = w/h
-                        # [放寬規則]
+                        # [規則修正]
                         if res_id==1 and asp>0.6: res_id=7 
                         if res_id==7 and asp<0.3: res_id=1
                         
+                        # 1. 畫框 (保持原本邏輯)
                         cv2.rectangle(draw_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        cv2.putText(draw_img, str(res_id), (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
                         
-                        cv2.putText(draw_img, str(res_id), (x, y-10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-                        
-                        display_text = f"**#{display_id}**: 數字 `{res_id}` (信心: {int(confidence*100)}%)"
+                        # 2. 準備文字區塊的內容
+                        # 第一行：文字描述
+                        text_part = f"#{display_id}: 數字  {res_id}"
                         if confidence < 1.0: 
                             alts = []
                             for alt_idx in top_indices[1:]:
                                 alt_conf = pred[alt_idx]
                                 if alt_conf > 0.01:
-                                    alts.append(f"`{alt_idx}` ({int(alt_conf*100)}%)")
+                                    alts.append(f"{alt_idx}({int(alt_conf*100)}%)")
                             if alts:
-                                display_text += f" ⚠️ 其他: {', '.join(alts)}"
+                                text_part += f" <span style='color:gray; font-size:0.8em'>⚠️ 其他: {', '.join(alts)}</span>"
                         
-                        current_results_list.append(display_text)
+                        # 第二行：HTML 進度條
+                        bar_part = get_bar_html(confidence)
+                        
+                        # 組合 HTML
+                        final_html = f"<div>{text_part}{bar_part}</div>"
+                        
+                        current_results_list.append(final_html)
                         detected_count += 1
                 
                 if current_results_list:
@@ -658,8 +686,9 @@ elif app_mode == "🎨 手寫板模式":
             st.write("---")
             st.markdown("#### 📊 詳細數據:")
             cols = st.columns(2)
-            for i, text in enumerate(st.session_state['hw_display_list']):
-                cols[i % 2].markdown(text)
+            for i, html_content in enumerate(st.session_state['hw_display_list']):
+                # [關鍵修改] 這裡開啟 unsafe_allow_html=True 才能顯示進度條
+                cols[i % 2].markdown(html_content, unsafe_allow_html=True)
 
     with c_right:
         st.markdown("### 👁️ 結果")
@@ -678,7 +707,7 @@ elif app_mode == "🎨 手寫板模式":
         st.write("##")
         if st.button("💾 上傳成績", key="hw_save", type="primary"):
             if hw_score > final_count:
-                st.error(f"❌ 錯誤：輸入數值 ({hw_score}) 超過偵測總數 ({final_count})，多了 {hw_score - final_count} 個，請重新輸入！")
+                st.error(f"❌ 錯誤：輸入數值 ({hw_score}) 超過偵測總數 ({final_count})")
             else:
                 st.session_state['stats']['handwriting']['total'] += final_count
                 st.session_state['stats']['handwriting']['correct'] += hw_score
@@ -698,10 +727,27 @@ elif app_mode == "🎨 手寫板模式":
                 st.toast("✅ 手寫成績已儲存！")
                 time.sleep(0.5)
                 st.rerun()
-
 # --- 上傳模式邏輯 ---
+# --- 修改處：圖片上傳模式 (包含圖片繪圖與 HTML 能量條) ---
+# --- 修改處：圖片上傳模式 (移除圖片上的能量條，保留 HTML 能量條) ---
 elif app_mode == "📁 圖片上傳模式":
     
+    # [輔助函式] 產生 HTML 進度條 (50%寬度)
+    def get_bar_html(confidence):
+        percent = min(int(confidence * 100), 100)
+        if confidence > 0.95: color = "#2ecc71"    # 綠
+        elif confidence > 0.85: color = "#f1c40f"  # 黃
+        else: color = "#e74c3c"                    # 紅
+        
+        return f"""
+        <div style="display: flex; align-items: center; margin-top: 4px;">
+            <div style="width: 50%; height: 8px; background-color: #444; border-radius: 4px; overflow: hidden;">
+                <div style="width: {percent}%; height: 100%; background-color: {color};"></div>
+            </div>
+            <span style="margin-left: 8px; font-size: 0.8em; color: {color};">{percent}%</span>
+        </div>
+        """
+
     col_up_left, col_up_right = st.columns([3, 1])
     
     with col_up_left:
@@ -732,18 +778,14 @@ elif app_mode == "📁 圖片上傳模式":
                     for i, cnt in enumerate(contours):
                         if hierarchy[0][i][3] == -1: # 只要外輪廓
                             area = cv2.contourArea(cnt)
-                            # [距離過濾] 面積過小忽略
                             if area > MIN_AREA:
                                 x, y, w, h = cv2.boundingRect(cnt)
-                                # [距離過濾] 高度過小忽略
                                 if h < MIN_HEIGHT: continue
                                 
                                 has_hole = hierarchy[0][i][2] != -1
                                 
-                                # ROI 提取與標準化
+                                # ROI 提取
                                 roi_single = binary_proc[y:y+h, x:x+w]
-                                
-                                # [Auto Deskew]
                                 roi_single = deskew(roi_single)
                                 
                                 side = max(w, h)
@@ -754,7 +796,6 @@ elif app_mode == "📁 圖片上傳模式":
                                 
                                 roi_single = cv2.resize(roi_single, (w, h))
                                 container[oy:oy+h, ox:ox+w] = roi_single
-                                
                                 roi_resized = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
 
                                 roi_norm = roi_resized.astype('float32') / 255.0
@@ -771,7 +812,7 @@ elif app_mode == "📁 圖片上傳模式":
                 results_text = []
                 
                 if len(batch_rois) > 0:
-                    # [ZIP 排序修正]
+                    # [排序] 由左至右
                     combined = list(zip(batch_rois, batch_info))
                     combined.sort(key=lambda x: x[1]["rect"][0]) 
                     
@@ -794,19 +835,35 @@ elif app_mode == "📁 圖片上傳模式":
                         has_hole = info["has_hole"]
                         aspect = info["aspect"]
                         
-                        # [放寬規則]
+                        # [規則修正]
                         if res_id == 1 and aspect > 0.6: res_id = 7 
                         elif res_id == 7 and aspect < 0.25: res_id = 1
                         if res_id == 7 and has_hole: res_id = 9
                         if res_id == 9 and not has_hole and confidence < 0.95: res_id = 7
                         if res_id == 0 and aspect < 0.5: res_id = 1
                         
+                        # 1. 畫框與數字 (圖片上) - 僅保留這個
                         cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                        
                         cv2.putText(display_img, str(res_id), (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                         
-                        line_text = f"**#{i+1}**: 數字 `{res_id}` (信心: {int(confidence*100)}%)"
-                        results_text.append(line_text)
+                        # [已移除] 原本畫在圖片上的能量條程式碼區塊
+                        
+                        # 2. 準備 HTML 文字區塊 (包含 HTML 能量條)
+                        text_part = f"#{i+1}: 數字  {res_id}"
+                        if confidence < 1.0:
+                            alts = []
+                            for alt_idx in top_indices[1:]:
+                                alt_conf = pred[alt_idx]
+                                if alt_conf > 0.01:
+                                    alts.append(f"{alt_idx}({int(alt_conf*100)}%)")
+                            if alts:
+                                text_part += f" <span style='color:gray; font-size:0.8em'>⚠️ 其他: {', '.join(alts)}</span>"
+                        
+                        # 產生 HTML 進度條
+                        bar_part = get_bar_html(confidence)
+                        final_html = f"<div>{text_part}{bar_part}</div>"
+                        
+                        results_text.append(final_html)
                         detected_count += 1
                 
                 # 存入 Session State
@@ -814,16 +871,17 @@ elif app_mode == "📁 圖片上傳模式":
                 st.session_state['upload_display_list'] = results_text
                 st.session_state['upload_result_count'] = detected_count
 
-            # 顯示結果
+            # 顯示結果圖片
             if st.session_state['upload_result_img'] is not None:
                 st.image(st.session_state['upload_result_img'], channels="BGR", use_container_width=True)
             
+            # 顯示詳細數據 (HTML 渲染)
             if st.session_state['upload_display_list']:
                 st.write("---")
                 st.markdown("#### 📊 辨識詳情")
                 ucols = st.columns(2)
                 for i, txt in enumerate(st.session_state['upload_display_list']):
-                    ucols[i % 2].markdown(txt)
+                    ucols[i % 2].markdown(txt, unsafe_allow_html=True)
 
     with col_up_right:
         st.markdown("### 👁️ 結果確認")
