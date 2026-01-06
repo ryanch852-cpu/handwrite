@@ -18,7 +18,11 @@ MIN_AREA = 140
 SHRINK_PX = 4
 STABILITY_DURATION = 1.2
 MOVEMENT_THRESHOLD = 80
-ROI_MARGIN = 60  
+
+# [已改回] 調整藍框大小 (改回原本的 60)
+ROI_MARGIN_X = 60   # 左右留白 
+ROI_MARGIN_Y = 60   # 上下留白
+
 TEXT_Y_OFFSET = 15 
 INFO_PANEL_WIDTH = 450 
 
@@ -90,7 +94,7 @@ class HandwriteProcessor(VideoProcessorBase):
         self.model = model
         self.last_boxes = []
         self.stability_start_time = None
-        self.frozen = False       
+        self.frozen = False        
         self.frozen_frame = None  
         self.detected_count = 0   
         self.ui_results = [] 
@@ -110,7 +114,9 @@ class HandwriteProcessor(VideoProcessorBase):
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        roi_rect = [ROI_MARGIN, ROI_MARGIN, w_f - 2*ROI_MARGIN, h_f - 2*ROI_MARGIN]
+        # [修改] 使用 X, Y Margin 來計算 roi_rect
+        roi_rect = [ROI_MARGIN_X, ROI_MARGIN_Y, w_f - 2*ROI_MARGIN_X, h_f - 2*ROI_MARGIN_Y]
+        
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
         
@@ -264,8 +270,9 @@ class HandwriteProcessor(VideoProcessorBase):
                 
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
-                    text_y = max(30, ROI_MARGIN - TEXT_Y_OFFSET) 
-                    cv2.putText(display_img, "CAPTURED!", (ROI_MARGIN, text_y), 
+                    # [修改] 文字位置根據 Y Margin 調整
+                    text_y = max(30, ROI_MARGIN_Y - TEXT_Y_OFFSET) 
+                    cv2.putText(display_img, "CAPTURED!", (ROI_MARGIN_X, text_y), 
                                 cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 255), 2)
                     
                     self.frozen_frame = display_img.copy()
