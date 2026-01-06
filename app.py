@@ -68,7 +68,7 @@ def load_ai_models():
             
             # 為了啟動速度，只用前 10000 筆資料訓練
             knn = KNeighborsClassifier(n_neighbors=3)
-            knn.fit(x_flat[:10000], y_train[:10000])
+            knn.fit(x_flat[:1000], y_train[:1000])
             
             joblib.dump(knn, knn_path)
             print("✅ KNN 模型訓練完成並儲存")
@@ -1029,4 +1029,5 @@ elif app_mode == "📁 圖片上傳模式":
                 st.session_state['last_uploaded_file_id'] = None
                 
                 time.sleep(0.5)
+
                 st.rerun()
