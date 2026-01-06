@@ -131,49 +131,31 @@ class HandwriteProcessor(VideoProcessorBase):
         self.frame_counter = 0
 
     def recv(self, frame):
-        # 1. 取得原始影像 (唯讀，速度快)
         img = frame.to_ndarray(format="bgr24")
         
-        # 2. 如果已經凍結，直接回傳凍結的畫面 (完全不運算)
         if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
-
-        # 3. [跳幀邏輯] 
-        self.frame_counter += 1
-        # 改為每 3 幀處理一次 (因為源頭 FPS 降低了，這裡不能跳太多，不然會鈍鈍的)
-        process_this_frame = (self.frame_counter % 3 == 0) 
-
-        # 如果這幀不處理，直接拿上一幀的結果來用，甚至不畫圖直接回傳原始影像
-        # 但為了使用者體驗，我們還是得把"舊的框"畫上去
         
-        # 建立要回傳的畫布 (這步最吃效能，無法避免，但我們可以縮小畫布)
-        display_img = img.copy() 
+        # 複製影像用於繪圖
+        display_img = img.copy()
         h_f, w_f = img.shape[:2]
         
-        # 繪製 ROI 藍框 (靜態)
+        # 繪製 ROI 藍框 (這是靜態的，每幀都要畫)
         roi_rect = [ROI_MARGIN_X, ROI_MARGIN_Y, w_f - 2*ROI_MARGIN_X, h_f - 2*ROI_MARGIN_Y]
         cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
                       (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
 
-        # === 快速通道 (Fast Path) ===
-        # 如果不是處理幀，直接畫上舊框就回傳
-        if not process_this_frame and self.last_boxes:
-            for item in self.last_boxes:
-                # 使用緩存的座標畫框
-                 # 注意：這裡為了效能，我們直接拿上次的 box 畫，雖然框可能會稍微"飄"一點點，但很順
-                x, y, w, h = item["box"]
-                # 簡單畫個綠框代表有抓到
-                cv2.rectangle(display_img, (x+ROI_MARGIN_X, y+ROI_MARGIN_Y), 
-                              (x+w+ROI_MARGIN_X, y+h+ROI_MARGIN_Y), (0, 255, 0), 2)
+        # --- [關鍵優化] 跳幀邏輯 ---
+        self.frame_counter += 1
+        process_this_frame = (self.frame_counter % self.skip_rate == 0)
+
+        # 如果不處理這一幀，我們直接把"上一次計算好的框"畫上去，節省 CPU 與時間
+        if not process_this_frame and len(self.cached_rois) > 0:
+            for (dx, dy, dw, dh, txt) in self.cached_rois:
+                cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), (0, 255, 0), 2)
+                cv2.putText(display_img, txt, (dx, dy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # 直接回傳，不做 OpenCV 運算
             return av.VideoFrame.from_ndarray(display_img, format="bgr24")
-        
-        # === 慢速通道 (AI Processing) ===
-        # (這裡放原本的影像處理程式碼，不用變動，因為已經被上面的 if 擋掉了)
-        # ... (原本的灰階、二值化、AI 預測程式碼) ...
-        
-        # 記得：所有 AI 算完後，要把結果存入 self.last_boxes 供快速通道使用
-        
-        return av.VideoFrame.from_ndarray(display_img, format="bgr24")
         
         # ---------------------------
         # 以下是原本的影像處理邏輯 (只有當 process_this_frame == True 才執行)
@@ -490,7 +472,6 @@ if model is None:
 # --- 5. 模式分支 ---
 
 # --- 5. 模式分支 (修改處) ---
-# --- 5. 模式分支 (極速優化版) ---
 if app_mode == "📷 攝影機模式 (Live)":
     
     col_cam, col_data = st.columns([2, 1])
@@ -500,16 +481,8 @@ if app_mode == "📷 攝影機模式 (Live)":
             key="handwrite-live",
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=HandwriteProcessor,
-            # [修改重點] 加入 frameRate 限制，並將解析度壓到 480x360
-            media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 480}, 
-                    "height": {"ideal": 360},
-                    "frameRate": {"ideal": 10, "max": 15}  # 強制限制在 10~15 FPS
-                },
-                "audio": False
-            },
-            # [新增] 嘗試使用 google 的 stun server (雖然你原本有，但確認一下)
+            # [修改] 將解析度改為 640x480 (或甚至 480x360)，大幅降低手機發熱與延遲
+            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
             rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             async_processing=True,
         )
