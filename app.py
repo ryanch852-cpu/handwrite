@@ -4,19 +4,19 @@ import numpy as np
 import os
 import time
 import av
-import joblib  # 用於儲存/讀取 KNN 模型
+import joblib   # 用於儲存/讀取 KNN 模型
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
-
+from streamlit_image_coordinates import streamlit_image_coordinates
 # 設定 TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 from tensorflow.keras.models import load_model
-from tensorflow.keras.datasets import mnist  # 用於訓練 KNN
+from tensorflow.keras.datasets import mnist   # 用於訓練 KNN
 from sklearn.neighbors import KNeighborsClassifier
 
 
-# --- 參數設定 ---
+# --- 參數設定 (完全保持原樣) ---
 # [距離控制]
 MIN_HEIGHT = 50       
 MIN_AREA = 500       
@@ -260,7 +260,7 @@ class HandwriteProcessor(VideoProcessorBase):
         detected_something = False
         current_frame_text_results = []
         
-        # [修改] 新增一個計數器，用於顯示連續的序號
+        # 新增一個計數器，用於顯示連續的序號
         valid_ui_counter = 1
 
         if len(batch_rois) > 0 and self.model is not None:
@@ -311,14 +311,12 @@ class HandwriteProcessor(VideoProcessorBase):
                     
                     cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), box_color, 2)
                     
-                    # [修改] 使用 valid_ui_counter 來顯示序號，而不是 i+1
                     text_label = f"#{valid_ui_counter}"
                     cv2.putText(display_img, text_label, (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     
                     self.cached_rois.append((draw_x, draw_y, draw_w, draw_h, text_label, box_color))
                     
                     # UI 文字 (Camera 模式用純文字)
-                    # [修改] 同步 UI 文字使用新的連續序號
                     info_text = f"**#{valid_ui_counter}**: 數字 `{res_id}` (信心: {int(confidence*100)}%){verify_msg}"
                     
                     if confidence < 1.0 and "KNN" not in verify_msg:
@@ -340,7 +338,7 @@ class HandwriteProcessor(VideoProcessorBase):
         if detected_something:
              self.ui_results = current_frame_text_results
 
-        # Stability 邏輯 (省略細節以節省版面，保持不變)
+        # Stability 邏輯
         if len(raw_boxes_for_stability) == 0:
             self.stability_start_time = None
         elif len(self.last_boxes) == 0:
@@ -409,6 +407,37 @@ if 'last_uploaded_file_id' not in st.session_state: st.session_state['last_uploa
 
 with st.sidebar:
     st.title("🎛️ 控制台")
+    
+    # --- [新增] 裝置顯示設定 (含自動重置邏輯) ---
+    st.markdown("### 📱 顯示設定")
+    
+    # 1. 讀取目前的模式
+    device_mode = st.radio(
+        "選擇您的裝置介面：",
+        ["🖥️ 電腦版 (並排佈局)", "📱 手機版 (垂直佈局)"],
+        index=0,
+        help="手機版會將畫面垂直排列並縮小畫布，以符合窄螢幕操作。"
+    )
+    is_mobile = "手機" in device_mode
+    
+    # 2. 偵測是否剛切換模式，如果是，強制重置狀態
+    if 'last_device_mode' not in st.session_state:
+        st.session_state['last_device_mode'] = device_mode
+
+    if st.session_state['last_device_mode'] != device_mode:
+        # ⚠️ 偵測到切換！執行大掃除
+        st.session_state['hw_result_img'] = None        # 清除舊的結果圖
+        st.session_state['hw_display_list'] = []        # 清除舊的文字列表
+        st.session_state['hw_result_count'] = 0         # 歸零計數
+        st.session_state['tracker_state'] = {}          # 清除追蹤ID
+        st.session_state['canvas_key'] = f"canvas_{time.time()}" # 強制換一張新畫布
+        
+        # 更新最後狀態並重新執行
+        st.session_state['last_device_mode'] = device_mode
+        st.rerun()
+    
+    st.divider() 
+    
     app_mode = st.radio("模式選擇", ["📷 鏡頭模式 (Live)", "🎨 手寫板模式", "📁 圖片上傳模式"], index=1)
     
     st.divider()
@@ -492,6 +521,18 @@ with st.sidebar:
             st.session_state['upload_result_count'] = 0
             st.rerun()
 
+# --- 版面配置輔助函式 ---
+def get_responsive_layout(ratios):
+    """
+    根據 is_mobile 變數決定回傳 Columns 還是 Containers
+    """
+    if is_mobile:
+        # 手機版：回傳一組 Container (垂直堆疊)
+        return [st.container() for _ in ratios]
+    else:
+        # 電腦版：回傳 Columns (左右並排)
+        return st.columns(ratios)
+
 st.title("📝 手寫數字辨識系統")
 
 with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
@@ -505,11 +546,7 @@ with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
     6. 如果鏡頭模式覺得不好用可以拍照貼到圖片上傳模式
     7. 有想反映的問題底下有表單可以填
     """)
-    # --- 在 Sidebar 加入回饋系統 ---
-    
     st.write("回饋單連結")
-    
-    # 方式 A：使用按鈕跳轉
     st.link_button("📝 填寫回饋表單", "https://forms.gle/wAgFbVvLSsJS63439", use_container_width=True)
  
 
@@ -519,9 +556,12 @@ if model is None:
 
 # --- 5. 模式分支 ---
 
-if app_mode == "📷 攝影機模式 (Live)":
+if app_mode == "📷 鏡頭模式 (Live)":
     
-    col_cam, col_data = st.columns([2, 1])
+    # [修改] 使用響應式佈局
+    layout_containers = get_responsive_layout([2, 1])
+    col_cam = layout_containers[0]
+    col_data = layout_containers[1]
 
     with col_cam:
         ctx = webrtc_streamer(
@@ -590,7 +630,6 @@ if app_mode == "📷 攝影機模式 (Live)":
                     
                 st.rerun()
 
-# ... (前面的程式碼保持不變)
 
 elif app_mode == "🎨 手寫板模式":
     
@@ -611,57 +650,82 @@ elif app_mode == "🎨 手寫板模式":
         </div>
         """
 
-    # --- 版面配置 ---
-    # ... (在 elif app_mode == "🎨 手寫板模式": 裡面) ...
-
-    c_left, c_right = st.columns([3, 2])
+    # --- [修改] 調整版面配置順序 ---
+    if is_mobile:
+        # 手機版：
+        canvas_width = 340
+        canvas_height = 230
+        
+        # [關鍵修改] 手機版：先畫布，後結果
+        c_canvas = st.container() 
+        c_res = st.container()    
+        
+    else:
+        # 電腦版：左右並排 (左邊畫布，右邊結果)
+        canvas_width = 850
+        canvas_height = 400
+        c_canvas, c_res = st.columns([3, 2])
     
-    with c_right:
+    # --------------------------------------
+
+    with c_res:
         st.markdown("### 👁️ 結果")
         result_image_placeholder = st.empty()
         
-        # 顯示圖片的邏輯 (之前改過的黑色空圖邏輯)
         if st.session_state['hw_result_img'] is not None:
              result_image_placeholder.image(st.session_state['hw_result_img'], channels="BGR", use_container_width=True)
         else:
-             blank_img = np.zeros((400, 600, 3), dtype=np.uint8)
-             cv2.putText(blank_img, "Waiting...", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
-             result_image_placeholder.image(blank_img, channels="BGR", use_container_width=True, caption="請在左側書寫")
+             # 預設等待圖 (大小同步調整)
+             blank_h = 230 if is_mobile else 400
+             blank_w = 340 if is_mobile else 600
+             blank_img = np.zeros((blank_h, blank_w, 3), dtype=np.uint8)
+             cv2.putText(blank_img, "Waiting...", (30, int(blank_h/2)+10), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+             result_image_placeholder.image(blank_img, channels="BGR", use_container_width=True, caption="請在畫布書寫")
 
         st.write("---")
-        
-        # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-        # [重要] 這裡一定要建立這個佔位符，輸入框才會出現在這裡！
         result_stats_placeholder = st.empty()
-        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     current_results_list = []
     
-    # 2. 左側畫布與邏輯
-    with c_left:
-        if st.button("🗑️ 清除畫布"):
-            st.session_state['canvas_key'] = f"canvas_{time.time()}"
-            st.session_state['tracker_state'] = {}
-            st.session_state['next_id'] = 1
-            st.session_state['hw_display_list'] = [] 
-            st.session_state['hw_result_img'] = None
-            st.session_state['hw_result_count'] = 0
-            st.rerun()
+    # 畫布與邏輯
+    with c_canvas:
+        
+        # --- [新增] 工具選擇 (畫筆 / 橡皮擦) ---
+        col_tool, col_clear = st.columns([2, 1])
+        with col_tool:
+            tool_mode = st.radio("🖊️ 工具", ["✏️ 畫筆", "🧽 橡皮擦"], horizontal=True, label_visibility="collapsed")
+        with col_clear:
+            if st.button("🗑️ 清除畫布", use_container_width=True):
+                st.session_state['canvas_key'] = f"canvas_{time.time()}"
+                st.session_state['tracker_state'] = {}
+                st.session_state['next_id'] = 1
+                st.session_state['hw_display_list'] = [] 
+                st.session_state['hw_result_img'] = None
+                st.session_state['hw_result_count'] = 0
+                st.rerun()
+
+        # 設定筆刷屬性
+        if tool_mode == "✏️ 畫筆":
+            stroke_color = "#FFFFFF" # 白色
+            stroke_width = 15
+        else:
+            stroke_color = "#000000" # 黑色 (背景色) = 橡皮擦
+            stroke_width = 40       # 橡皮擦大一點比較好擦
 
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
-            stroke_width=15,
-            stroke_color="#FFFFFF",
+            stroke_width=stroke_width,  # 動態調整
+            stroke_color=stroke_color,  # 動態調整
             background_color="#000000",
-            height=400,  
-            width=850,   
+            height=canvas_height,
+            width=canvas_width,
             drawing_mode="freedraw",
             key=st.session_state['canvas_key'],
             display_toolbar=False,
             update_streamlit=True, 
         )
         
-        # --- 核心處理邏輯 (保持原本邏輯不變) ---
+        # --- 核心處理邏輯 (含視覺內縮優化) ---
         if canvas_result.image_data is not None:
             img_data = canvas_result.image_data.astype(np.uint8)
             
@@ -740,7 +804,13 @@ elif app_mode == "🎨 手寫板模式":
                                     box_color = (0, 165, 255)
                             except: pass
                         
-                        cv2.rectangle(draw_img, (x, y), (x+w, y+h), box_color, 2)
+                        # 視覺內縮 (Shrink)
+                        dx = x + SHRINK_PX
+                        dy = y + SHRINK_PX
+                        dw = max(1, w - 2*SHRINK_PX)
+                        dh = max(1, h - 2*SHRINK_PX)
+                        
+                        cv2.rectangle(draw_img, (dx, dy), (dx+dw, dy+dh), box_color, 2)
                         cv2.putText(draw_img, final_res, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
                         
                         text_part = f"<div>#{valid_ui_counter}: 數字 <strong>{res_id}</strong></div>"
@@ -757,15 +827,15 @@ elif app_mode == "🎨 手寫板模式":
                         detected_count += 1
                         valid_ui_counter += 1
 
-                # 更新圖片與狀態
+                # 更新圖片與狀態 (會更新到上方的 c_res 中)
                 result_image_placeholder.image(draw_img, channels="BGR", use_container_width=True)
                 
                 st.session_state['hw_display_list'] = current_results_list
                 st.session_state['hw_result_img'] = draw_img
                 st.session_state['hw_result_count'] = detected_count
 
-    # 3. 顯示下方的詳細數據
-    with c_left:
+    # 顯示下方的詳細數據 (放在畫布下方)
+    with c_canvas:
         if st.session_state['hw_display_list']:
             st.write("---")
             st.markdown("#### 📊 詳細數據:")
@@ -780,7 +850,6 @@ elif app_mode == "🎨 手寫板模式":
     wrapper_style = "min-height: 60px; margin-bottom: 10px;"
     
     if final_count > 0:
-        # 綠色狀態
         status_html = f"""
         <div style="{wrapper_style}">
             <div style="
@@ -794,7 +863,6 @@ elif app_mode == "🎨 手寫板模式":
         </div>
         """
     else:
-        # 藍色狀態 (佔位)
         status_html = f"""
         <div style="{wrapper_style}">
             <div style="
@@ -809,10 +877,7 @@ elif app_mode == "🎨 手寫板模式":
         """
         
     status_placeholder.markdown(status_html, unsafe_allow_html=True)
-    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
     
-    # [關鍵] 輸入框放在 placeholder 外面！
-    # 這樣 status_placeholder 更新時，這個輸入框就不會被銷毀重蓋
     hw_score = st.number_input("輸入數量", min_value=0, value=final_count, key="hw_input")
     
     st.write("##")
@@ -840,6 +905,12 @@ elif app_mode == "🎨 手寫板模式":
             st.rerun()
 
 elif app_mode == "📁 圖片上傳模式":
+
+    # --- 初始化 session_state ---
+    if 'ignored_boxes' not in st.session_state:
+        st.session_state['ignored_boxes'] = set()
+    if 'manual_boxes' not in st.session_state:
+        st.session_state['manual_boxes'] = []
 
     # --- 1. 來源判斷 ---
     def detect_image_source(img_bgr):
@@ -943,14 +1014,61 @@ elif app_mode == "📁 圖片上傳模式":
         color = "#ff9f43" if is_uncertain else ("#2ecc71" if confidence > 0.95 else "#f1c40f")
         return f"""<div style="display:flex;align-items:center;margin-top:4px;"><div style="width:50%;height:8px;background:#444;border-radius:4px;overflow:hidden;"><div style="width:{percent}%;height:100%;background:{color};"></div></div><span style="margin-left:8px;font-size:0.8em;color:{color};">{percent}%</span></div>"""
 
+    # --- 7. 手動補點邏輯 ---
+    def try_add_manual_box(click_x, click_y, binary_img, model):
+        h, w = binary_img.shape
+        # 1. 範圍檢查
+        if not (0 <= click_x < w and 0 <= click_y < h):
+            return None, "❌ 點擊位置超出範圍"
+
+        # 2. 尋找輪廓
+        cnts, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        target_contour = None
+        for c in cnts:
+            if cv2.pointPolygonTest(c, (click_x, click_y), False) >= 0:
+                target_contour = c
+                break
+        
+        if target_contour is None:
+            return None, "⚠️ 沒點到東西 (請點擊文字筆跡的黑色區域)"
+
+        # 3. 取得外框
+        bx, by, bw, bh = cv2.boundingRect(target_contour)
+        if bw < 5 or bh < 10: 
+            return None, "⚠️ 區域太小，視為雜訊"
+
+        # 4. 預測
+        roi = binary_img[by:by+bh, bx:bx+bw]
+        roi_processed = preprocess_for_mnist(roi)
+        input_data = roi_processed.reshape(1, 28, 28, 1).astype('float32') / 255.0
+        pred = model.predict(input_data, verbose=0)[0]
+        res_id = np.argmax(pred)
+        conf = float(pred[res_id])
+
+        return {
+            "rect": (bx, by, bw, bh),
+            "label": int(res_id),
+            "conf": conf
+        }, f"✅ 手動加入成功：數字 {res_id}"
+
+
     # --- UI 介面 ---
-    col_up_left, col_up_right = st.columns([3, 1])
+    layout_containers = get_responsive_layout([3, 1])
+    col_up_left = layout_containers[0]
+    col_up_right = layout_containers[1]
+    
     with col_up_left:
         c_u1, c_u2 = st.columns([0.6, 0.4])
         with c_u1: uploaded_file = st.file_uploader("請上傳圖片 (JPG, PNG)", type=['png', 'jpg', 'jpeg'])
         with c_u2:
             st.write("##")
             example_choice = st.selectbox("或使用範例圖片", ["請選擇...", "範例 1 (手寫)", "範例 2 (手寫)", "範例 3 (小畫家)", "範例 4 (非數字類)"])
+            
+            # 重置按鈕
+            if st.button("🔄 重置所有忽略/手動框", use_container_width=True):
+                st.session_state['ignored_boxes'] = set()
+                st.session_state['manual_boxes'] = [] 
+                st.rerun()
 
         img, source_id = None, None
         if example_choice != "請選擇...":
@@ -962,13 +1080,17 @@ elif app_mode == "📁 圖片上傳模式":
         if uploaded_file is not None:
             file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
             img, source_id = cv2.imdecode(file_bytes, 1), uploaded_file.file_id
+        
+        if source_id != st.session_state.get('last_uploaded_file_id'):
+            st.session_state['ignored_boxes'] = set()
+            st.session_state['manual_boxes'] = [] 
 
-        # --- 核心辨識邏輯 ---
-        if img is not None and st.session_state['last_uploaded_file_id'] != source_id:
+        if img is not None:
             st.session_state['last_uploaded_file_id'] = source_id
             source_type = detect_image_source(img)
             display_img, gray = img.copy(), cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
+            # --- 影像處理 ---
             if source_type == "photo":
                 thresh = cv2.adaptiveThreshold(cv2.bilateralFilter(gray, 9, 75, 75), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 12)
                 binary_proc = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
@@ -987,7 +1109,9 @@ elif app_mode == "📁 圖片上傳模式":
             batch_rois, batch_info = [], []
             for (x, y, w, h) in final_boxes:
                 roi = binary_proc[y:y+h, x:x+w]
-                if source_type == "photo" and h < 150: roi = deskew(roi)
+                if source_type == "photo" and h < 150: 
+                    try: roi = deskew(roi)
+                    except: pass 
                 f_norm = preprocess_for_mnist(roi)
                 has_hole = False
                 c_sub, h_sub = cv2.findContours(f_norm, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -998,62 +1122,235 @@ elif app_mode == "📁 圖片上傳模式":
                 batch_info.append({"rect": (x, y, w, h), "has_hole": has_hole, "aspect": w/float(h), "flat": f_norm.reshape(1, 784).astype('float32') / 255.0})
 
             results_text, v_count = [], 1
+            all_boxes_data = [] 
+
+            # --- [Part A] 自動偵測 ---
             if batch_rois:
                 preds = model.predict(np.stack(batch_rois), verbose=0)
                 comb = sorted(list(zip(preds, batch_info)), key=lambda x: x[1]["rect"][0])
                 scale = max(1.0, img.shape[1] / 800.0)
+                
                 for pred, info in comb:
+                    bx, by, bw, bh = info["rect"]
+                    box_id = f"{bx}_{by}_{bw}_{bh}"
+                    
                     res_id = np.argmax(pred); conf = pred[res_id]
                     d_thr = 0.3 if source_type == "digital" else CONFIDENCE_THRESHOLD
                     if info["rect"][3] > 150: d_thr = 0.5
+
+                    all_boxes_data.append({
+                        "rect": (bx, by, bw, bh),
+                        "id": box_id,
+                        "conf": conf,
+                        "thr": d_thr
+                    })
+
+                    is_ignored = box_id in st.session_state['ignored_boxes']
+
+                    if is_ignored:
+                        cv2.rectangle(display_img, (bx, by), (bx+bw, by+bh), (128, 128, 128), 2)
+                        cv2.line(display_img, (bx, by), (bx+bw, by+bh), (128, 128, 128), 2)
+                        cv2.line(display_img, (bx+bw, by), (bx, by+bh), (128, 128, 128), 2)
+                        continue
+
                     if conf < d_thr: continue
+                    
                     if res_id == 7 and info["aspect"] < 0.25: res_id = 1
                     if res_id == 1 and info["has_hole"]: res_id = 0
                     if source_type == "digital" and info["aspect"] < 0.2: res_id = 1
+                    
                     color, extra_msg, is_uncertain = (0, 255, 0), "", False
                     if knn_model is not None and KNN_VERIFY_RANGE[0] <= conf <= 0.99:
                         try:
                             k_res = knn_model.predict(info["flat"])[0]
                             if k_res != res_id: extra_msg = f" (KNN: {k_res})"; is_uncertain = True; color = (0, 165, 255)
                         except: pass
-                    x, y, w, h = info["rect"]
-                    cv2.rectangle(display_img, (x, y), (x+w, y+h), color, max(2, int(3*scale)))
-                    cv2.putText(display_img, str(res_id), (x, y - TEXT_Y_OFFSET), cv2.FONT_HERSHEY_SIMPLEX, 1.0*scale, (0, 0, 255), max(2, int(3*scale)))
+                    
+                    cv2.rectangle(display_img, (bx, by), (bx+bw, by+bh), color, max(2, int(3*scale)))
+                    cv2.putText(display_img, str(res_id), (bx, by - TEXT_Y_OFFSET), cv2.FONT_HERSHEY_SIMPLEX, 1.0*scale, (0, 0, 255), max(2, int(3*scale)))
                     results_text.append(f"<div><strong>#{v_count}</strong>: {res_id} {extra_msg} {get_bar_html(conf, is_uncertain)}</div>")
                     v_count += 1
             
+            # --- [Part B] 手動加入的框 ---
+            if 'manual_boxes' in st.session_state:
+                for mbox in st.session_state['manual_boxes']:
+                    bx, by, bw, bh = mbox['rect']
+                    lbl = mbox.get('label', mbox.get('digit', '?'))
+                    conf = mbox['conf']
+                    
+                    cv2.rectangle(display_img, (bx, by), (bx+bw, by+bh), (255, 0, 255), 2)
+                    cv2.putText(display_img, str(lbl), (bx, by - 5), cv2.FONT_HERSHEY_SIMPLEX, 
+                               1.0, (255, 0, 255), 2)
+                    
+                    bar_html = get_bar_html(conf, is_uncertain=True)
+                    results_text.append(f"<div><strong>#{v_count} (手動)</strong>: {lbl} {bar_html}</div>")
+                    v_count += 1
+
+            # --- [Part C] 存檔 ---
             st.session_state['upload_result_img'] = display_img
             st.session_state['upload_display_list'] = results_text
             st.session_state['upload_result_count'] = v_count - 1
 
+        # --- 顯示圖片與刪除/補點邏輯 ---
         if st.session_state['upload_result_img'] is not None:
-            st.image(st.session_state['upload_result_img'], channels="BGR", use_container_width=True)
+            
+            # 🟢 [修改 1] 加入滑桿：讓使用者可以自己調整大小 (手機板救星)
+            # 手機上建議調到 350-400 左右，電腦上可以用 700-800
+            st.write("---") # 分隔線
+            display_width = st.slider("🔍 圖片顯示大小 (手機若跑版請調小)", min_value=300, max_value=1000, value=700)
+
+            # 1. 計算縮放 (根據滑桿數值)
+            orig_h, orig_w = st.session_state['upload_result_img'].shape[:2]
+            scale_ratio = display_width / float(orig_w)
+            new_height = int(orig_h * scale_ratio)
+            resized_display_img = cv2.resize(st.session_state['upload_result_img'], (display_width, new_height))
+            resized_display_img_rgb = cv2.cvtColor(resized_display_img, cv2.COLOR_BGR2RGB)
+
+            # 2. 開關
+            c_mode, c_info = st.columns([1, 2])
+            with c_mode:
+                delete_mode = st.toggle("🗑️ 啟用編輯模式", value=False, help="開啟後，點擊綠框/紫框可刪除；點擊黑色筆跡可手動補框")
+            with c_info:
+                if delete_mode:
+                    st.warning("⚠️ 點擊綠框/紫框=刪除 | 點擊黑字=手動新增")
+                else:
+                    st.info("👆 開啟左側開關以進行修改。")
+
+            # 3. 顯示圖片
+            if delete_mode:
+                # [編輯模式]：必須使用固定寬度 (由滑桿控制)，座標才會準
+                value = streamlit_image_coordinates(
+                    resized_display_img_rgb, 
+                    key="click_img",
+                    width=display_width 
+                )
+
+                if 'last_clicked_value' not in st.session_state:
+                    st.session_state['last_clicked_value'] = None
+
+                if value is not None and value != st.session_state['last_clicked_value']:
+                    st.session_state['last_clicked_value'] = value
+                    
+                    click_x = value['x']
+                    click_y = value['y']
+                    real_x = int(click_x / scale_ratio)
+                    real_y = int(click_y / scale_ratio)
+                    
+                    clicked_existing = False
+                    
+                    # 1. 優先檢查是否點擊到「手動框」 (紫色) -> 刪除
+                    if 'manual_boxes' in st.session_state:
+                        for i, mbox in enumerate(st.session_state['manual_boxes']):
+                            bx, by, bw, bh = mbox['rect']
+                            if bx <= real_x <= bx + bw and by <= real_y <= by + bh:
+                                st.session_state['manual_boxes'].pop(i)
+                                st.toast("🗑️ 已刪除手動框")
+                                clicked_existing = True
+                                time.sleep(0.1)
+                                st.rerun()
+                                break
+                    
+                    # 2. 檢查「自動框」 (綠色/灰色) -> 切換忽略狀態
+                    if not clicked_existing:
+                        for box_data in all_boxes_data:
+                            bx, by, bw, bh = box_data["rect"]
+                            
+                            if bx <= real_x <= bx + bw and by <= real_y <= by + bh:
+                                box_id = box_data["id"]
+                                
+                                # 穿透隱形框邏輯
+                                if box_id not in st.session_state['ignored_boxes'] and box_data["conf"] < box_data["thr"]:
+                                    continue 
+
+                                if box_id in st.session_state['ignored_boxes']:
+                                    st.session_state['ignored_boxes'].remove(box_id)
+                                    st.toast(f"✅ 已恢復自動框")
+                                else:
+                                    st.session_state['ignored_boxes'].add(box_id)
+                                    st.toast(f"🗑️ 已刪除自動框")
+                                clicked_existing = True
+                                st.rerun()
+                                break
+                    
+                    # 3. 手動補點
+                    if not clicked_existing:
+                        new_box_data, msg = try_add_manual_box(real_x, real_y, binary_proc, model)
+
+                        if new_box_data:
+                            st.session_state['manual_boxes'].append(new_box_data)
+                            st.toast(msg)
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.toast(msg)
+
+            else:
+                # 🟢 [修改 2] 瀏覽模式：使用 use_container_width=True
+                # 這會讓圖片自動適應手機螢幕寬度，不會再跑版了
+                st.image(resized_display_img_rgb, use_container_width=True)
+            
             if st.session_state['upload_display_list']:
                 st.divider(); st.markdown("#### 📊 辨識清單"); cols = st.columns(3)
                 for i, h in enumerate(st.session_state['upload_display_list']): cols[i % 3].markdown(h, unsafe_allow_html=True)
 
     with col_up_right:
         st.markdown("### 📝 確認")
-        f_cnt = st.session_state['upload_result_count']
         
-        # --- 判斷邏輯與禁用狀態 ---
-        # 如果有圖片但偵測數量為 0
+        # 取得目前偵測數量
+        f_cnt = st.session_state.get('upload_result_count', 0)
+        
+        # 狀態判斷
         is_disabled = False
         if (uploaded_file is not None or example_choice != "請選擇..."):
             if f_cnt > 0:
                 st.success(f"偵測到 {f_cnt} 個")
             else:
                 st.error("⚠️ 無法偵測")
-                is_disabled = True # 設定禁用標記
+                is_disabled = True 
+        else:
+             is_disabled = True
+
+        # 🟢 [修改重點]：設定 max_value=f_cnt
+        # 這樣輸入的數字就永遠不會超過偵測到的總數 (防呆)
+        real_val = st.number_input(
+            "正確數量", 
+            min_value=0, 
+            max_value=f_cnt,  # <--- 限制最大值等於偵測數量
+            value=f_cnt,      # 預設值
+            key="up_input_val", 
+            disabled=is_disabled
+        )
         
-        # 根據偵測結果禁用輸入框
-        real_val = st.number_input("正確數量", min_value=0, value=f_cnt, key="up_input_val", disabled=is_disabled)
-        
-        # 根據偵測結果禁用按鈕
+        # 按鈕事件 (包含之前的結構防呆)
         if st.button("💾 上傳成績", type="primary", use_container_width=True, disabled=is_disabled):
-            st.session_state['stats']['upload']['total'] += f_cnt
-            st.session_state['stats']['upload']['correct'] += real_val
-            st.session_state['history']['upload'].append({'total': f_cnt, 'correct': real_val})
-            st.toast("✅ 已儲存")
-            st.session_state['upload_result_img'] = None; st.session_state['last_uploaded_file_id'] = None
-            time.sleep(0.5); st.rerun()
+            try:
+                # 確保資料結構存在
+                if 'stats' not in st.session_state: st.session_state['stats'] = {}
+                if 'upload' not in st.session_state['stats']: st.session_state['stats']['upload'] = {'total': 0, 'correct': 0}
+                if 'history' not in st.session_state: st.session_state['history'] = {}
+                if 'upload' not in st.session_state['history']: st.session_state['history']['upload'] = []
+
+                # 寫入數據
+                st.session_state['stats']['upload']['total'] += f_cnt
+                st.session_state['stats']['upload']['correct'] += real_val
+                
+                st.session_state['history']['upload'].append({
+                    'total': f_cnt, 
+                    'correct': real_val
+                })
+                
+                st.toast(f"✅ 已儲存！(偵測: {f_cnt} / 正確: {real_val})")
+                
+                # 重置狀態
+                st.session_state['upload_result_img'] = None
+                st.session_state['last_uploaded_file_id'] = None
+                st.session_state['ignored_boxes'] = set()
+                st.session_state['manual_boxes'] = []
+                st.session_state['upload_display_list'] = []
+                st.session_state['upload_result_count'] = 0
+                
+                time.sleep(0.5)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ 錯誤: {str(e)}")
