@@ -409,7 +409,7 @@ if 'last_uploaded_file_id' not in st.session_state: st.session_state['last_uploa
 
 with st.sidebar:
     st.title("🎛️ 控制台")
-    app_mode = st.radio("模式選擇", ["📷 攝影機模式 (Live)", "🎨 手寫板模式", "📁 圖片上傳模式"], index=1)
+    app_mode = st.radio("模式選擇", ["📷 鏡頭模式 (Live)", "🎨 手寫板模式", "📁 圖片上傳模式"], index=1)
     
     st.divider()
     
