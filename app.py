@@ -15,6 +15,7 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.datasets import mnist  # 用於訓練 KNN
 from sklearn.neighbors import KNeighborsClassifier
 
+
 # --- 參數設定 ---
 # [距離控制]
 MIN_HEIGHT = 50       
@@ -501,8 +502,16 @@ with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
     3. 數字**1**不要畫底線，會被判定成其他數字。
     4. 數字盡量寫正。
     5. 鏡頭模式中顯示的是序號，實際數值請點選📋 顯示詳情查看
-    > **注意**：系統設定信心度低於 **{int(CONFIDENCE_THRESHOLD*100)}%** 的結果將不會顯示。
+    6. 如果鏡頭模式覺得不好用可以拍照貼到圖片上傳模式
+    7. 有想反映的問題底下有表單可以填
     """)
+    # --- 在 Sidebar 加入回饋系統 ---
+    
+    st.write("回饋單連結")
+    
+    # 方式 A：使用按鈕跳轉
+    st.link_button("📝 填寫回饋表單", "https://forms.gle/wAgFbVvLSsJS63439", use_container_width=True)
+ 
 
 if model is None:
     st.error("❌ 找不到 `mnist_cnn.h5`！")
@@ -835,7 +844,9 @@ elif app_mode == "📁 圖片上傳模式":
     # --- 1. 來源判斷 ---
     def detect_image_source(img_bgr):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        return "digital" if (np.sum(gray > 250) / gray.size) > 0.3 else "photo"
+        extreme_pixels = np.sum((gray < 10) | (gray > 245))
+        ratio = extreme_pixels / gray.size
+        return "digital" if ratio > 0.5 else "photo"
 
     # --- 2. 物理融合 ---
     def merge_overlapping_boxes(boxes):
@@ -871,57 +882,26 @@ elif app_mode == "📁 圖片上傳模式":
                 merged.append(curr)
         return merged
 
-    # --- 3. [分流修正] 尺寸過濾器 (數位寬鬆，手機嚴格) ---
-    def filter_small_boxes(boxes, img_height, source_type):
+    # --- 3. 尺寸過濾 ---
+    def filter_small_boxes(boxes, img_height, img_width, source_type):
         if not boxes: return []
-        
-        # 1. 數位模式：極度寬鬆 (保護 2)
+        total_area = img_width * img_height
         if source_type == "digital":
-            kept = []
-            for box in boxes:
-                # 只要不是奈米級雜點 (h>15) 就保留
-                if box[3] > 15: kept.append(box)
+            kept = [box for box in boxes if (box[2] * box[3]) < (total_area * 0.6) and box[3] > 5]
             return kept
-
-        # 2. 手機模式：嚴格過濾 (殺污漬)
-        
-        # 絕對底線 (2%)
         abs_min_h = int(img_height * 0.02)
-        
-        # 計算中位數 (只用有效框)
         valid_h = [b[3] for b in boxes if b[3] > abs_min_h]
-        valid_area = [b[2]*b[3] for b in boxes if b[3] > abs_min_h]
-        
         median_h = np.median(valid_h) if valid_h else 0
-        median_area = np.median(valid_area) if valid_area else 0
-        
         kept_boxes = []
         for box in boxes:
             w, h = box[2], box[3]
-            area = w * h
+            if (w * h) > (total_area * 0.6) or h < abs_min_h: continue
             aspect = w / float(h)
-            
-            # [規則 A] 絕對底線
-            if h < abs_min_h: continue
-            
-            # [規則 B] 瘦子保護 (針對 1)
-            if aspect < 0.35:
-                # 瘦子只要有 35% 平均身高就過
-                if median_h > 0 and h > (median_h * 0.35):
-                    kept_boxes.append(box)
-                continue
-            
-            # [規則 C] 一般物件 (針對 0, 2, 污漬)
-            # 1. 身高必須達到中位數的 50%
-            if median_h > 0 and h < (median_h * 0.5):
-                continue
-                
-            # 2. 面積必須達到中位數的 20% (殺小圓點)
-            if median_area > 0 and area < (median_area * 0.2):
-                continue
-
+            if aspect < 0.35 and median_h > 0 and h > (median_h * 0.35):
+                kept_boxes.append(box); continue
+            if median_h > 0 and h < (median_h * 0.5): continue
+            if source_type == "photo" and h < 65 and 0.7 < aspect < 1.3: continue
             kept_boxes.append(box)
-            
         return kept_boxes
 
     # --- 4. 墨水濃度過濾 ---
@@ -930,18 +910,15 @@ elif app_mode == "📁 圖片上傳模式":
         flat = np.sort(gray_img.ravel())
         ink_black = np.mean(flat[:int(len(flat)*0.02)])
         paper_bg = np.median(flat)
-        dynamic_range = paper_bg - ink_black
-        threshold = paper_bg - (dynamic_range * 0.6)
-        
+        threshold = paper_bg - ((paper_bg - ink_black) * 0.6)
         kept_boxes = []
         for box in boxes:
             x, y, w, h = box
             roi = gray_img[y:y+h, x:x+w]
             if roi.size == 0: continue
             roi_flat = np.sort(roi.ravel())
-            roi_darkest = np.mean(roi_flat[:max(1, int(len(roi_flat)*0.1))])
-            if roi_darkest > threshold: continue
-            kept_boxes.append(box)
+            if np.mean(roi_flat[:max(1, int(len(roi_flat)*0.1))]) <= threshold:
+                kept_boxes.append(box)
         return kept_boxes
 
     # --- 5. MNIST 標準化 ---
@@ -949,228 +926,134 @@ elif app_mode == "📁 圖片上傳模式":
         h, w = roi_binary.shape
         canvas = np.zeros((28, 28), dtype=np.uint8)
         scale = 20.0 / max(h, w)
-        nh = max(1, int(h * scale))
-        nw = max(1, int(w * scale))
+        nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
         roi_resized = cv2.resize(roi_binary, (nw, nh), interpolation=cv2.INTER_AREA)
-        y_off = (28 - nh) // 2
-        x_off = (28 - nw) // 2
-        y_end = min(y_off + nh, 28)
-        x_end = min(x_off + nw, 28)
-        canvas[y_off:y_end, x_off:x_end] = roi_resized[:y_end-y_off, :x_end-x_off]
-        
+        y_off, x_off = (28 - nh) // 2, (28 - nw) // 2
+        canvas[y_off:y_off+nh, x_off:x_off+nw] = roi_resized
         _, canvas = cv2.threshold(canvas, 10, 255, cv2.THRESH_BINARY)
-        
         M = cv2.moments(canvas)
         if M["m00"] > 0:
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-            shift_x = 14 - cx
-            shift_y = 14 - cy
-            M_shift = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-            canvas = cv2.warpAffine(canvas, M_shift, (28, 28))
-        canvas = cv2.dilate(canvas, None, iterations=1)
-        return canvas
+            cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+            canvas = cv2.warpAffine(canvas, np.float32([[1, 0, 14-cx], [0, 1, 14-cy]]), (28, 28))
+        return cv2.dilate(canvas, None, iterations=1)
 
-    # --- 信心度條 ---
+    # --- 6. 能量條 ---
     def get_bar_html(confidence, is_uncertain=False):
         percent = min(int(confidence * 100), 100)
-        color = "#e74c3c"
-        if is_uncertain: color = "#ff9f43"
-        elif confidence > 0.95: color = "#2ecc71"
-        elif confidence > 0.85: color = "#f1c40f"
-        return f"""
-        <div style="display: flex; align-items: center; margin-top: 4px;">
-            <div style="width: 50%; height: 8px; background-color: #444; border-radius: 4px; overflow: hidden;">
-                <div style="width: {percent}%; height: 100%; background-color: {color};"></div>
-            </div>
-            <span style="margin-left: 8px; font-size: 0.8em; color: {color};">{percent}%</span>
-        </div>
-        """
+        color = "#ff9f43" if is_uncertain else ("#2ecc71" if confidence > 0.95 else "#f1c40f")
+        return f"""<div style="display:flex;align-items:center;margin-top:4px;"><div style="width:50%;height:8px;background:#444;border-radius:4px;overflow:hidden;"><div style="width:{percent}%;height:100%;background:{color};"></div></div><span style="margin-left:8px;font-size:0.8em;color:{color};">{percent}%</span></div>"""
 
+    # --- UI 介面 ---
     col_up_left, col_up_right = st.columns([3, 1])
-    
     with col_up_left:
-        uploaded_file = st.file_uploader("請上傳圖片 (JPG, PNG)", type=['png', 'jpg', 'jpeg'])
-        
+        c_u1, c_u2 = st.columns([0.6, 0.4])
+        with c_u1: uploaded_file = st.file_uploader("請上傳圖片 (JPG, PNG)", type=['png', 'jpg', 'jpeg'])
+        with c_u2:
+            st.write("##")
+            example_choice = st.selectbox("或使用範例圖片", ["請選擇...", "範例 1 (手寫)", "範例 2 (手寫)", "範例 3 (小畫家)", "範例 4 (非數字類)"])
+
+        img, source_id = None, None
+        if example_choice != "請選擇...":
+            ex_map = {"範例 1 (手寫)": "examples/ex1.jpg", "範例 2 (手寫)": "examples/ex2.jpg", "範例 3 (小畫家)": "examples/ex3.png", "範例 4 (非數字類)": "examples/ex4.jpg"}
+            path = ex_map.get(example_choice)
+            if os.path.exists(path): img, source_id = cv2.imread(path), path
+            else: st.error(f"找不到檔案: {path}")
+
         if uploaded_file is not None:
             file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, 1)
+            img, source_id = cv2.imdecode(file_bytes, 1), uploaded_file.file_id
+
+        # --- 核心辨識邏輯 ---
+        if img is not None and st.session_state['last_uploaded_file_id'] != source_id:
+            st.session_state['last_uploaded_file_id'] = source_id
+            source_type = detect_image_source(img)
+            display_img, gray = img.copy(), cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
-            if st.session_state['last_uploaded_file_id'] != uploaded_file.file_id:
-                st.session_state['last_uploaded_file_id'] = uploaded_file.file_id
-                
-                source_type = detect_image_source(img)
-                display_img = img.copy()
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                
-                # 前處理
-                if source_type == "photo":
-                    st.info("📸 模式：手機翻拍 (嚴格除垢)")
-                    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-                    thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                                   cv2.THRESH_BINARY_INV, 45, 12)
-                    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-                    binary_proc = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect)
-                    min_area_limit = 10 
-                else:
-                    st.success("💻 模式：數位截圖")
-                    _, binary_proc = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-                    binary_proc = cv2.morphologyEx(binary_proc, cv2.MORPH_CLOSE, kernel_connect)
-                    min_area_limit = 30
+            if source_type == "photo":
+                thresh = cv2.adaptiveThreshold(cv2.bilateralFilter(gray, 9, 75, 75), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 12)
+                binary_proc = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+                min_area_limit = 10 
+            else:
+                _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
+                binary_proc = cv2.dilate(thresh, None, iterations=2)
+                binary_proc = cv2.morphologyEx(binary_proc, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (20, 3)))
+                min_area_limit = 5
 
-                with st.expander("👀 Debug: 機器看到的畫面"):
-                    st.image(binary_proc, caption="二值化結果", clamp=True, channels='GRAY')
+            cnts, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            raw_boxes = [cv2.boundingRect(c) for c in cnts if cv2.contourArea(c) > min_area_limit]
+            sized_boxes = filter_small_boxes(merge_overlapping_boxes(raw_boxes), img.shape[0], img.shape[1], source_type)
+            final_boxes = filter_low_contrast_boxes(sized_boxes, gray) if source_type == "photo" else sized_boxes
 
-                contours, hierarchy = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                raw_boxes = []
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    if area < min_area_limit: continue
-                    if h < 5: continue 
-                    raw_boxes.append((x, y, w, h))
+            batch_rois, batch_info = [], []
+            for (x, y, w, h) in final_boxes:
+                roi = binary_proc[y:y+h, x:x+w]
+                if source_type == "photo" and h < 150: roi = deskew(roi)
+                f_norm = preprocess_for_mnist(roi)
+                has_hole = False
+                c_sub, h_sub = cv2.findContours(f_norm, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                if h_sub is not None:
+                    for idx, cc in enumerate(c_sub):
+                        if h_sub[0][idx][3] != -1 and cv2.contourArea(cc) > 5: has_hole = True; break
+                batch_rois.append(f_norm.reshape(28, 28, 1).astype('float32') / 255.0)
+                batch_info.append({"rect": (x, y, w, h), "has_hole": has_hole, "aspect": w/float(h), "flat": f_norm.reshape(1, 784).astype('float32') / 255.0})
 
-                merged_boxes = merge_overlapping_boxes(raw_boxes)
-                
-                # [關鍵] 分流過濾 (傳入 source_type)
-                h_img_total = img.shape[0]
-                sized_boxes = filter_small_boxes(merged_boxes, h_img_total, source_type)
-                
-                # 只有照片才需要墨水過濾
-                final_boxes = sized_boxes
-                if source_type == "photo":
-                    final_boxes = filter_low_contrast_boxes(sized_boxes, gray)
-
-                batch_rois = []
-                batch_info = []
-                
-                for (x, y, w, h) in final_boxes:
-                    roi = binary_proc[y:y+h, x:x+w]
-                    
-                    if source_type == "photo" and h < 150:
-                        roi = deskew(roi)
-                    
-                    final_norm = preprocess_for_mnist(roi)
-                    final_input = final_norm.astype('float32') / 255.0
-                    
-                    has_hole = False
-                    roi_u8 = (final_input * 255).astype(np.uint8)
-                    _, t_roi = cv2.threshold(roi_u8, 50, 255, cv2.THRESH_BINARY)
-                    c_sub, h_sub = cv2.findContours(t_roi, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-                    if h_sub is not None:
-                        for idx, cc in enumerate(c_sub):
-                            if h_sub[0][idx][3] != -1 and cv2.contourArea(cc) > 5:
-                                has_hole = True
-                                break
-
-                    batch_rois.append(final_input.reshape(28, 28, 1))
-                    batch_info.append({
-                        "rect": (x, y, w, h),
-                        "has_hole": has_hole,
-                        "aspect": w / float(h),
-                        "flat_input": final_input.reshape(1, 784)
-                    })
-
-                detected_count = 0
-                results_text = []
-                valid_ui_counter = 1
-                
-                h_disp, w_disp = display_img.shape[:2]
-                scale = max(1.0, w_disp / 800.0)
-                font_s = 1.0 * scale
-                thick = max(2, int(3 * scale))
-
-                if len(batch_rois) > 0:
-                    combined = list(zip(batch_rois, batch_info))
-                    combined.sort(key=lambda x: x[1]["rect"][0])
-                    
-                    sorted_rois = [x[0] for x in combined]
-                    sorted_info = [x[1] for x in combined]
-                    
-                    predictions = model.predict(np.stack(sorted_rois), verbose=0)
-                    
-                    for i, pred in enumerate(predictions):
-                        top_indices = pred.argsort()[-3:][::-1]
-                        res_id = top_indices[0]
-                        confidence = pred[res_id]
-                        
-                        info = sorted_info[i]
-                        x, y, w, h = info["rect"]
-                        has_hole = info["has_hole"]
-                        aspect = info["aspect"]
-
-                        thresh = CONFIDENCE_THRESHOLD
-                        if h > 150: thresh = 0.5
-                        if confidence < thresh: continue
-
-                        if res_id == 7 and aspect < 0.25: res_id = 1
-                        if res_id == 1 and has_hole: res_id = 0
-                        if source_type == "digital" and aspect < 0.2: res_id = 1
-                        
-                        color = (0, 255, 0)
-                        extra_msg = ""
-                        
-                        if knn_model is not None and KNN_VERIFY_RANGE[0] <= confidence <= 0.99:
-                             try:
-                                k_res = knn_model.predict(info["flat_input"])[0]
-                                if k_res != res_id:
-                                    extra_msg = f" (KNN: {k_res})"
-                                    if res_id == 8 and k_res == 9 and has_hole:
-                                        res_id = 9
-                                        color = (0, 165, 255)
-                             except: pass
-
-                        cv2.rectangle(display_img, (x, y), (x+w, y+h), color, thick)
-                        cv2.putText(display_img, str(res_id), (x, y - 5), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 0, 255), thick)
-
-                        text_html = f"<div><strong>#{valid_ui_counter}</strong>: {res_id} <span style='font-size:0.8em; color:gray'>{extra_msg}</span></div>"
-                        bar_html = get_bar_html(confidence)
-                        results_text.append(f"<div style='margin-bottom:8px'>{text_html}{bar_html}</div>")
-                        
-                        detected_count += 1
-                        valid_ui_counter += 1
-
-                st.session_state['upload_result_img'] = display_img
-                st.session_state['upload_display_list'] = results_text
-                st.session_state['upload_result_count'] = detected_count
-
-            if st.session_state['upload_result_img'] is not None:
-                st.image(st.session_state['upload_result_img'], channels="BGR", use_container_width=True)
+            results_text, v_count = [], 1
+            if batch_rois:
+                preds = model.predict(np.stack(batch_rois), verbose=0)
+                comb = sorted(list(zip(preds, batch_info)), key=lambda x: x[1]["rect"][0])
+                scale = max(1.0, img.shape[1] / 800.0)
+                for pred, info in comb:
+                    res_id = np.argmax(pred); conf = pred[res_id]
+                    d_thr = 0.3 if source_type == "digital" else CONFIDENCE_THRESHOLD
+                    if info["rect"][3] > 150: d_thr = 0.5
+                    if conf < d_thr: continue
+                    if res_id == 7 and info["aspect"] < 0.25: res_id = 1
+                    if res_id == 1 and info["has_hole"]: res_id = 0
+                    if source_type == "digital" and info["aspect"] < 0.2: res_id = 1
+                    color, extra_msg, is_uncertain = (0, 255, 0), "", False
+                    if knn_model is not None and KNN_VERIFY_RANGE[0] <= conf <= 0.99:
+                        try:
+                            k_res = knn_model.predict(info["flat"])[0]
+                            if k_res != res_id: extra_msg = f" (KNN: {k_res})"; is_uncertain = True; color = (0, 165, 255)
+                        except: pass
+                    x, y, w, h = info["rect"]
+                    cv2.rectangle(display_img, (x, y), (x+w, y+h), color, max(2, int(3*scale)))
+                    cv2.putText(display_img, str(res_id), (x, y - TEXT_Y_OFFSET), cv2.FONT_HERSHEY_SIMPLEX, 1.0*scale, (0, 0, 255), max(2, int(3*scale)))
+                    results_text.append(f"<div><strong>#{v_count}</strong>: {res_id} {extra_msg} {get_bar_html(conf, is_uncertain)}</div>")
+                    v_count += 1
             
+            st.session_state['upload_result_img'] = display_img
+            st.session_state['upload_display_list'] = results_text
+            st.session_state['upload_result_count'] = v_count - 1
+
+        if st.session_state['upload_result_img'] is not None:
+            st.image(st.session_state['upload_result_img'], channels="BGR", use_container_width=True)
             if st.session_state['upload_display_list']:
-                st.divider()
-                st.markdown("#### 📊 辨識結果")
-                cols = st.columns(3)
-                for idx, txt in enumerate(st.session_state['upload_display_list']):
-                    cols[idx % 3].markdown(txt, unsafe_allow_html=True)
+                st.divider(); st.markdown("#### 📊 辨識清單"); cols = st.columns(3)
+                for i, h in enumerate(st.session_state['upload_display_list']): cols[i % 3].markdown(h, unsafe_allow_html=True)
 
     with col_up_right:
         st.markdown("### 📝 確認")
-        final_cnt = st.session_state['upload_result_count']
+        f_cnt = st.session_state['upload_result_count']
         
-        if final_cnt > 0:
-            st.success(f"偵測到 {final_cnt} 個")
-        else:
-            if uploaded_file: st.warning("未偵測到")
-            
-        real_val = st.number_input("正確數量", min_value=0, value=final_cnt, key="up_input_val")
-        
-        st.write("##")
-        if st.button("💾 上傳成績", type="primary", use_container_width=True):
-            if final_cnt == 0 and real_val == 0:
-                st.toast("無資料")
+        # --- 判斷邏輯與禁用狀態 ---
+        # 如果有圖片但偵測數量為 0
+        is_disabled = False
+        if (uploaded_file is not None or example_choice != "請選擇..."):
+            if f_cnt > 0:
+                st.success(f"偵測到 {f_cnt} 個")
             else:
-                save_val = final_cnt if final_cnt > 0 else real_val
-                st.session_state['stats']['upload']['total'] += save_val
-                st.session_state['stats']['upload']['correct'] += real_val
-                st.session_state['history']['upload'].append({'total': save_val, 'correct': real_val})
-                st.toast("✅ 已儲存")
-                st.session_state['upload_result_img'] = None
-                st.session_state['upload_display_list'] = []
-                st.session_state['upload_result_count'] = 0
-                st.session_state['last_uploaded_file_id'] = None
-                time.sleep(0.5)
-
-                st.rerun()
+                st.error("⚠️ 無法偵測")
+                is_disabled = True # 設定禁用標記
+        
+        # 根據偵測結果禁用輸入框
+        real_val = st.number_input("正確數量", min_value=0, value=f_cnt, key="up_input_val", disabled=is_disabled)
+        
+        # 根據偵測結果禁用按鈕
+        if st.button("💾 上傳成績", type="primary", use_container_width=True, disabled=is_disabled):
+            st.session_state['stats']['upload']['total'] += f_cnt
+            st.session_state['stats']['upload']['correct'] += real_val
+            st.session_state['history']['upload'].append({'total': f_cnt, 'correct': real_val})
+            st.toast("✅ 已儲存")
+            st.session_state['upload_result_img'] = None; st.session_state['last_uploaded_file_id'] = None
+            time.sleep(0.5); st.rerun()
