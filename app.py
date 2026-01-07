@@ -1198,7 +1198,7 @@ elif app_mode == "📁 圖片上傳模式":
             # 🟢 [修改 1] 加入滑桿：讓使用者可以自己調整大小 (手機板救星)
             # 手機上建議調到 350-400 左右，電腦上可以用 700-800
             st.write("---") # 分隔線
-            display_width = st.slider("🔍 圖片顯示大小 (手機若跑版請調小)", min_value=300, max_value=1000, value=700)
+            display_width = st.slider("🔍 圖片顯示大小 (手機若跑版請調小)，只有編輯模式能調", min_value=300, max_value=1000, value=700)
 
             # 1. 計算縮放 (根據滑桿數值)
             orig_h, orig_w = st.session_state['upload_result_img'].shape[:2]
@@ -1215,7 +1215,7 @@ elif app_mode == "📁 圖片上傳模式":
                 if delete_mode:
                     st.warning("⚠️ 點擊綠框/紫框=刪除 | 點擊黑字=手動新增")
                 else:
-                    st.info("👆 開啟左側開關以進行修改。")
+                    st.info("這讓數字被判定成陰影或污漬時還原數字，因此有些非數字類也容易被誤判")
 
             # 3. 顯示圖片
             if delete_mode:
