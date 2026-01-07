@@ -1158,7 +1158,7 @@ elif app_mode == "📁 圖片上傳模式":
         real_val = st.number_input("正確數量", min_value=0, value=final_cnt, key="up_input_val")
         
         st.write("##")
-        if st.button("💾 儲存", type="primary", use_container_width=True):
+        if st.button("💾 上傳成績", type="primary", use_container_width=True):
             if final_cnt == 0 and real_val == 0:
                 st.toast("無資料")
             else:
@@ -1172,4 +1172,5 @@ elif app_mode == "📁 圖片上傳模式":
                 st.session_state['upload_result_count'] = 0
                 st.session_state['last_uploaded_file_id'] = None
                 time.sleep(0.5)
+
                 st.rerun()
