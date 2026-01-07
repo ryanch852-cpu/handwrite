@@ -7,3 +7,4 @@ streamlit-drawable-canvas
 streamlit-webrtc
 av
 joblib 
+streamlit_image_coordinates
