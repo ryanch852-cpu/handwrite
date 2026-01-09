@@ -4,43 +4,32 @@ import numpy as np
 import os
 import time
 import av
-import joblib   # 用於儲存/讀取 KNN 模型
-from PIL import Image
+import joblib
 from streamlit_drawable_canvas import st_canvas
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 from streamlit_image_coordinates import streamlit_image_coordinates
+
 # 設定 TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 from tensorflow.keras.models import load_model
-from tensorflow.keras.datasets import mnist   # 用於訓練 KNN
+from tensorflow.keras.datasets import mnist
 from sklearn.neighbors import KNeighborsClassifier
 
-
-# --- 參數設定 (完全保持原樣) ---
-# [距離控制]
+# --- 參數設定 ---
 MIN_HEIGHT = 50       
 MIN_AREA = 500       
-
 SHRINK_PX = 4
 STABILITY_DURATION = 1.2
 MOVEMENT_THRESHOLD = 80
-
-# [過濾] 第一道防線：CNN 信心度門檻
 CONFIDENCE_THRESHOLD = 0.85 
-
-# [雙重驗證] 第二道防線：灰色地帶
 KNN_VERIFY_RANGE = (0.85, 0.95)
-
-# [設定] 藍框大小
 ROI_MARGIN_X = 60   
 ROI_MARGIN_Y = 60   
 TEXT_Y_OFFSET = 15 
 
 # --- 1. 模型載入與初始化 ---
-
 @st.cache_resource
 def load_ai_models():
-    # 1. 載入 CNN
     cnn = None
     if os.path.exists("mnist_cnn.h5"):
         try:
@@ -49,10 +38,8 @@ def load_ai_models():
         except:
             print("❌ CNN 模型載入失敗")
     
-    # 2. 載入或訓練 KNN (作為第二道防線)
     knn = None
     knn_path = "knn_model.pkl"
-    
     if os.path.exists(knn_path):
         try:
             knn = joblib.load(knn_path)
@@ -60,61 +47,245 @@ def load_ai_models():
         except:
             print("⚠️ KNN 模型損壞，重新訓練...")
     
-    # 如果沒有 KNN 模型，現場訓練一個 (輕量版)
     if knn is None:
         print("⏳ 正在訓練 KNN 輔助模型 (僅需一次)...")
         try:
             (x_train, y_train), _ = mnist.load_data()
             x_flat = x_train.reshape(-1, 784) / 255.0
-            
-            # 為了啟動速度，只用前 10000 筆資料訓練
             knn = KNeighborsClassifier(n_neighbors=3)
             knn.fit(x_flat[:10000], y_train[:10000])
-            
             joblib.dump(knn, knn_path)
             print("✅ KNN 模型訓練完成並儲存")
         except Exception as e:
             print(f"❌ KNN 訓練失敗: {e}")
             knn = None
-
     return cnn, knn
 
 model, knn_model = load_ai_models()
 
-# --- [自動扶正] Deskewing ---
+# --- 2. 核心演算法 (通用) ---
+def center_by_moments_cnn(src):
+    img = src.copy()
+    m = cv2.moments(img, True)
+    if m['m00'] < 0.1: return cv2.resize(img, (28, 28))
+    cX, cY = m['m10'] / m['m00'], m['m01'] / m['m00']
+    tX, tY = 14.0 - cX, 14.0 - cY
+    M = np.float32([[1, 0, tX], [0, 1, tY]])
+    return cv2.warpAffine(img, M, (28, 28), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
 def deskew(img):
     m = cv2.moments(img)
-    if abs(m['mu02']) < 1e-2:
-        return img
+    if abs(m['mu02']) < 1e-2: return img
     skew = m['mu11'] / m['mu02']
     M = np.float32([[1, skew, -0.5 * img.shape[0] * skew], [0, 1, 0]])
     img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR)
     return img
 
-# --- 2. 核心檢測功能 ---
 def is_valid_content(img_bgr):
     if img_bgr is None or img_bgr.size == 0: return False
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mean_h = np.mean(hsv[:,:,0])
     mean_s = np.mean(hsv[:,:,1])
     if mean_s > 60: return False
     if 30 < mean_s <= 60:
+        mean_h = np.mean(hsv[:,:,0])
         if (mean_h < 25 or mean_h > 155): return False
     return True
 
-# 手寫模式專用：ID 追蹤與匹配
-def update_tracker(contours):
-    current_items = []
-    for cnt in contours:
-        M = cv2.moments(cnt)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            current_items.append({'cnt': cnt, 'center': (cx, cy), 'id': None})
+# --- 3. 圖片上傳模式專用函式 (補回遺失的部分) ---
+def detect_image_source(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    extreme_pixels = np.sum((gray < 10) | (gray > 245))
+    ratio = extreme_pixels / gray.size
+    return "digital" if ratio > 0.5 else "photo"
 
+def merge_overlapping_boxes(boxes):
+    if len(boxes) < 2: return boxes
+    merged = []
+    while len(boxes) > 0:
+        curr = boxes.pop(0)
+        x1, y1, w1, h1 = curr
+        rx1, ry1 = x1 + w1, y1 + h1
+        has_overlap = False
+        i = 0
+        while i < len(boxes):
+            next_box = boxes[i]
+            x2, y2, w2, h2 = next_box
+            rx2, ry2 = x2 + w2, y2 + h2
+            pad = 15
+            overlap = not ((rx1 + pad) < x2 or (x1 - pad) > rx2 or (ry1 + pad) < y2 or (y1 - pad) > ry2)
+            if overlap:
+                new_x = min(x1, x2)
+                new_y = min(y1, y2)
+                new_w = max(rx1, rx2) - new_x
+                new_h = max(ry1, ry2) - new_y
+                curr = (new_x, new_y, new_w, new_h)
+                x1, y1, w1, h1 = curr
+                rx1, ry1 = new_x + new_w, new_y + new_h
+                boxes.pop(i)
+                has_overlap = True
+            else:
+                i += 1
+        if has_overlap:
+            boxes.insert(0, curr)
+        else:
+            merged.append(curr)
+    return merged
+
+def filter_small_boxes(boxes, img_height, img_width, source_type):
+    if not boxes: return []
+    total_area = img_width * img_height
+    if source_type == "digital":
+        kept = [box for box in boxes if (box[2] * box[3]) < (total_area * 0.6) and box[3] > 5]
+        return kept
+    abs_min_h = int(img_height * 0.02)
+    valid_h = [b[3] for b in boxes if b[3] > abs_min_h]
+    median_h = np.median(valid_h) if valid_h else 0
+    kept_boxes = []
+    for box in boxes:
+        w, h = box[2], box[3]
+        if (w * h) > (total_area * 0.6) or h < abs_min_h: continue
+        aspect = w / float(h)
+        if aspect < 0.35 and median_h > 0 and h > (median_h * 0.35):
+            kept_boxes.append(box); continue
+        if median_h > 0 and h < (median_h * 0.5): continue
+        if source_type == "photo" and h < 65 and 0.7 < aspect < 1.3: continue
+        kept_boxes.append(box)
+    return kept_boxes
+
+def filter_low_contrast_boxes(boxes, gray_img):
+    if not boxes: return []
+    flat = np.sort(gray_img.ravel())
+    ink_black = np.mean(flat[:int(len(flat)*0.02)])
+    paper_bg = np.median(flat)
+    threshold = paper_bg - ((paper_bg - ink_black) * 0.6)
+    kept_boxes = []
+    for box in boxes:
+        x, y, w, h = box
+        roi = gray_img[y:y+h, x:x+w]
+        if roi.size == 0: continue
+        roi_flat = np.sort(roi.ravel())
+        if np.mean(roi_flat[:max(1, int(len(roi_flat)*0.1))]) <= threshold:
+            kept_boxes.append(box)
+    return kept_boxes
+
+def preprocess_for_mnist(roi_binary):
+    h, w = roi_binary.shape
+    canvas = np.zeros((28, 28), dtype=np.uint8)
+    scale = 20.0 / max(h, w)
+    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+    roi_resized = cv2.resize(roi_binary, (nw, nh), interpolation=cv2.INTER_AREA)
+    y_off, x_off = (28 - nh) // 2, (28 - nw) // 2
+    canvas[y_off:y_off+nh, x_off:x_off+nw] = roi_resized
+    _, canvas = cv2.threshold(canvas, 10, 255, cv2.THRESH_BINARY)
+    M = cv2.moments(canvas)
+    if M["m00"] > 0:
+        cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+        canvas = cv2.warpAffine(canvas, np.float32([[1, 0, 14-cx], [0, 1, 14-cy]]), (28, 28))
+    return cv2.dilate(canvas, None, iterations=1)
+
+def try_add_manual_box(click_x, click_y, binary_img, model):
+    h, w = binary_img.shape
+    if not (0 <= click_x < w and 0 <= click_y < h):
+        return None, "❌ 點擊位置超出範圍"
+    cnts, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    target_contour = None
+    for c in cnts:
+        if cv2.pointPolygonTest(c, (click_x, click_y), False) >= 0:
+            target_contour = c
+            break
+    if target_contour is None:
+        return None, "⚠️ 沒點到東西 (請點擊文字筆跡的黑色區域)"
+    bx, by, bw, bh = cv2.boundingRect(target_contour)
+    if bw < 5 or bh < 10: 
+        return None, "⚠️ 區域太小，視為雜訊"
+    roi = binary_img[by:by+bh, bx:bx+bw]
+    roi_processed = preprocess_for_mnist(roi)
+    input_data = roi_processed.reshape(1, 28, 28, 1).astype('float32') / 255.0
+    pred = model.predict(input_data, verbose=0)[0]
+    res_id = np.argmax(pred)
+    conf = float(pred[res_id])
+    return {
+        "rect": (bx, by, bw, bh),
+        "label": int(res_id),
+        "conf": conf
+    }, f"✅ 手動加入成功：數字 {res_id}"
+
+# --- 4. 手寫模式專用：智慧合併邏輯 (Time + Distance) ---
+def get_edge_distance(r1, r2):
+    x1, y1, w1, h1 = r1
+    x2, y2, w2, h2 = r2
+    rx1, ry1 = x1 + w1, y1 + h1
+    rx2, ry2 = x2 + w2, y2 + h2
+    dx = max(0, max(x1 - rx2, x2 - rx1))
+    dy = max(0, max(y1 - ry2, y2 - ry1))
+    return np.sqrt(dx*dx + dy*dy)
+
+def merge_boxes_logic(contours, merge_dist_limit, time_limit):
+    if 'box_cache' not in st.session_state:
+        st.session_state['box_cache'] = []
+    current_time = time.time()
+    raw_boxes = [cv2.boundingRect(cnt) for cnt in contours]
+    current_boxes_with_time = []
+    
+    for r_new in raw_boxes:
+        assigned_time = current_time
+        best_overlap = 0
+        for old_item in st.session_state['box_cache']:
+            ox, oy, ow, oh = old_item['rect']
+            ix = max(r_new[0], ox)
+            iy = max(r_new[1], oy)
+            iw = min(r_new[0]+r_new[2], ox+ow) - ix
+            ih = min(r_new[1]+r_new[3], oy+oh) - iy
+            if iw > 0 and ih > 0:
+                overlap = iw * ih
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    assigned_time = old_item['time']
+        current_boxes_with_time.append({'rect': r_new, 'time': assigned_time})
+
+    has_merged = True
+    while has_merged:
+        has_merged = False
+        new_list = []
+        skip_indices = set()
+        for i in range(len(current_boxes_with_time)):
+            if i in skip_indices: continue
+            merged_rect = current_boxes_with_time[i]['rect']
+            merged_time = current_boxes_with_time[i]['time']
+            for j in range(i + 1, len(current_boxes_with_time)):
+                if j in skip_indices: continue
+                b1 = current_boxes_with_time[i]
+                b2 = current_boxes_with_time[j]
+                dist = get_edge_distance(merged_rect, b2['rect'])
+                time_diff = abs(merged_time - b2['time'])
+                
+                if dist < merge_dist_limit and time_diff < time_limit:
+                    x1, y1 = merged_rect[0], merged_rect[1]
+                    x2, y2 = merged_rect[0] + merged_rect[2], merged_rect[1] + merged_rect[3]
+                    bx1, by1 = b2['rect'][0], b2['rect'][1]
+                    bx2, by2 = b2['rect'][0] + b2['rect'][2], b2['rect'][1] + b2['rect'][3]
+                    nx1, ny1 = min(x1, bx1), min(y1, by1)
+                    nx2, ny2 = max(x2, bx2), max(y2, by2)
+                    merged_rect = (nx1, ny1, nx2 - nx1, ny2 - ny1)
+                    merged_time = max(merged_time, b2['time'])
+                    skip_indices.add(j)
+                    has_merged = True
+            new_list.append({'rect': merged_rect, 'time': merged_time})
+        if has_merged: current_boxes_with_time = new_list
+        else: break
+
+    st.session_state['box_cache'] = current_boxes_with_time
+    final_output = []
+    for item in current_boxes_with_time:
+        x, y, w, h = item['rect']
+        cx, cy = x + w//2, y + h//2
+        final_output.append({'rect': (x,y,w,h), 'center': (cx, cy)})
+    return final_output
+
+def update_tracker_from_boxes(box_items):
+    current_items = box_items
     used_current_indices = set()
     new_tracker_state = {}
-    
     if 'tracker_state' in st.session_state:
         for old_id, old_center in st.session_state['tracker_state'].items():
             min_dist = 9999
@@ -125,23 +296,33 @@ def update_tracker(contours):
                 if dist < 50 and dist < min_dist:
                     min_dist = dist
                     match_idx = i
-            
             if match_idx != -1:
                 current_items[match_idx]['id'] = old_id
                 used_current_indices.add(match_idx)
                 new_tracker_state[old_id] = current_items[match_idx]['center']
-
     for i, item in enumerate(current_items):
-        if item['id'] is None:
+        if 'id' not in item:
             item['id'] = st.session_state['next_id']
             st.session_state['next_id'] += 1
             new_tracker_state[item['id']] = item['center']
-
     st.session_state['tracker_state'] = new_tracker_state
     current_items.sort(key=lambda x: x['id'])
     return current_items
 
-# --- 3. WebRTC 影像處理器 ---
+# --- 5. 介面輔助函式 ---
+def get_responsive_layout(ratios):
+    # 需要使用全域變數 is_mobile
+    if st.session_state.get('last_device_mode') and "手機" in st.session_state['last_device_mode']:
+        return [st.container() for _ in ratios]
+    else:
+        return st.columns(ratios)
+
+def get_bar_html(confidence, is_uncertain=False):
+    percent = min(int(confidence * 100), 100)
+    color = "#ff9f43" if is_uncertain else "#2ecc71" if confidence > 0.95 else "#f1c40f"
+    return f"""<div style="display:flex;align-items:center;margin-top:4px;"><div style="width:50%;height:8px;background:#444;border-radius:4px;overflow:hidden;"><div style="width:{percent}%;height:100%;background:{color};"></div></div><span style="margin-left:8px;font-size:0.8em;color:{color};">{percent}%</span></div>"""
+
+# --- 6. Processor (鏡頭模式用) ---
 class HandwriteProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = model
@@ -152,7 +333,6 @@ class HandwriteProcessor(VideoProcessorBase):
         self.frozen_frame = None  
         self.detected_count = 0   
         self.ui_results = [] 
-        
         self.frame_counter = 0
         self.skip_rate = 4  
         self.cached_rois = [] 
@@ -166,27 +346,22 @@ class HandwriteProcessor(VideoProcessorBase):
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        
         if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
         
         display_img = img.copy()
         h_f, w_f = img.shape[:2]
-        
         roi_rect = [ROI_MARGIN_X, ROI_MARGIN_Y, w_f - 2*ROI_MARGIN_X, h_f - 2*ROI_MARGIN_Y]
-        cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), 
-                      (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
+        cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
 
         self.frame_counter += 1
-        process_this_frame = (self.frame_counter % self.skip_rate == 0)
-
-        if not process_this_frame and len(self.cached_rois) > 0:
-            for (dx, dy, dw, dh, txt, box_color) in self.cached_rois:
-                cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), box_color, 2)
-                cv2.putText(display_img, txt, (dx, dy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        if not (self.frame_counter % self.skip_rate == 0):
+            if len(self.cached_rois) > 0:
+                for (dx, dy, dw, dh, txt, box_color) in self.cached_rois:
+                    cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), box_color, 2)
+                    cv2.putText(display_img, txt, (dx, dy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             return av.VideoFrame.from_ndarray(display_img, format="bgr24")
         
-        # --- 處理邏輯 ---
         roi_img = img[roi_rect[1]:roi_rect[1]+roi_rect[3], roi_rect[0]:roi_rect[0]+roi_rect[2]]
         if roi_img.size == 0: return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
@@ -196,7 +371,6 @@ class HandwriteProcessor(VideoProcessorBase):
         binary_proc = cv2.dilate(thresh, None, iterations=2)
         
         contours, hierarchy = cv2.findContours(binary_proc, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        
         valid_boxes = []
         if hierarchy is not None:
             for i, cnt in enumerate(contours):
@@ -205,62 +379,38 @@ class HandwriteProcessor(VideoProcessorBase):
                     if area > MIN_AREA:
                         x, y, w, h = cv2.boundingRect(cnt)
                         has_hole = hierarchy[0][i][2] != -1
-                        valid_boxes.append({
-                            "box": (x, y, w, h), 
-                            "has_hole": has_hole,
-                            "aspect_ratio": w / float(h)
-                        })
+                        valid_boxes.append({"box": (x, y, w, h), "has_hole": has_hole, "aspect_ratio": w / float(h)})
         
         valid_boxes = sorted(valid_boxes, key=lambda b: b["box"][0])
-        
-        batch_rois = []
-        batch_info = []
-        raw_boxes_for_stability = [] 
-        
+        batch_rois, batch_info, raw_boxes_for_stability = [], [], []
         self.cached_rois = []
 
         for item in valid_boxes:
             x, y, w, h = item["box"]
             rx, ry = x + roi_rect[0], y + roi_rect[1]
-            
             if x < 5 or y < 5 or (x+w) > binary_proc.shape[1]-5 or (y+h) > binary_proc.shape[0]-5: continue
             if h < MIN_HEIGHT: continue
-            
             roi_color = display_img[ry:ry+h, rx:rx+w]
             if not is_valid_content(roi_color): continue
             
             raw_boxes_for_stability.append(item)
-            
-            roi_single = binary_proc[y:y+h, x:x+w]
-            roi_single = deskew(roi_single)
-
+            roi_single = deskew(binary_proc[y:y+h, x:x+w])
             side = max(w, h)
             padding = int(side * 0.2)
             container_size = side + padding * 2
             container = np.zeros((container_size, container_size), dtype=np.uint8)
             offset_y = (container_size - h) // 2
             offset_x = (container_size - w) // 2
-            
             roi_single = cv2.resize(roi_single, (w, h)) 
             container[offset_y:offset_y+h, offset_x:offset_x+w] = roi_single
             roi_resized = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
-            
             roi_norm = roi_resized.astype('float32') / 255.0
-            roi_ready = roi_norm.reshape(28, 28, 1)
-            
-            batch_rois.append(roi_ready)
-            batch_info.append({
-                "coords": (rx, ry, w, h),
-                "has_hole": item["has_hole"],
-                "aspect": item["aspect_ratio"],
-                "flat_input": roi_norm.reshape(1, 784) # 用於 KNN
-            })
+            batch_rois.append(roi_norm.reshape(28, 28, 1))
+            batch_info.append({"coords": (rx, ry, w, h), "has_hole": item["has_hole"], "aspect": item["aspect_ratio"], "flat_input": roi_norm.reshape(1, 784)})
             
         detected_count = 0
         detected_something = False
         current_frame_text_results = []
-        
-        # 新增一個計數器，用於顯示連續的序號
         valid_ui_counter = 1
 
         if len(batch_rois) > 0 and self.model is not None:
@@ -268,77 +418,53 @@ class HandwriteProcessor(VideoProcessorBase):
             try:
                 batch_input = np.stack(batch_rois)
                 predictions = self.model.predict(batch_input, verbose=0)
-                
                 for i, pred in enumerate(predictions):
                     top_indices = pred.argsort()[-3:][::-1]
                     res_id = top_indices[0]
                     confidence = pred[res_id]
-                    
                     if confidence < CONFIDENCE_THRESHOLD: continue 
 
                     info = batch_info[i]
                     rx, ry, w, h = info["coords"]
-                    has_hole = info["has_hole"]
                     aspect = info["aspect"]
+                    has_hole = info["has_hole"]
                     
-                    # 邏輯判斷
                     if res_id == 1 and aspect > 0.6: res_id = 7
                     elif res_id == 7 and aspect < 0.25: res_id = 1
                     if res_id == 7 and has_hole: res_id = 9
                     if res_id == 9 and not has_hole and confidence < 0.95: res_id = 7
                     if res_id == 0 and aspect < 0.5: res_id = 1
                     
-                    # --- [KNN 雙重驗證] ---
                     final_label_str = str(res_id)
-                    box_color = (0, 255, 0) # 預設綠色
+                    box_color = (0, 255, 0)
                     verify_msg = ""
-                    
                     if self.knn is not None and KNN_VERIFY_RANGE[0] <= confidence <= KNN_VERIFY_RANGE[1]:
                         try:
                             knn_pred = self.knn.predict(info["flat_input"])[0]
                             if knn_pred != res_id:
-                                final_label_str = str(res_id) 
+                                final_label_str = str(res_id)
                                 verify_msg = f" ⚠️ KNN: {knn_pred}"
-                                box_color = (0, 165, 255) # 橘色表示有疑慮
-                        except:
-                            pass
-                    # ----------------------------
+                                box_color = (0, 165, 255)
+                        except: pass
                     
                     draw_x = rx + SHRINK_PX
                     draw_y = ry + SHRINK_PX
                     draw_w = max(1, w - (SHRINK_PX * 2))
                     draw_h = max(1, h - (SHRINK_PX * 2))
-                    
                     cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), box_color, 2)
-                    
                     text_label = f"#{valid_ui_counter}"
                     cv2.putText(display_img, text_label, (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    
                     self.cached_rois.append((draw_x, draw_y, draw_w, draw_h, text_label, box_color))
                     
-                    # UI 文字 (Camera 模式用純文字)
                     info_text = f"**#{valid_ui_counter}**: 數字 `{res_id}` (信心: {int(confidence*100)}%){verify_msg}"
-                    
-                    if confidence < 1.0 and "KNN" not in verify_msg:
-                        alt_id = top_indices[1]
-                        alt_conf = pred[alt_id]
-                        if alt_conf > 0.01:
-                            info_text += f" <span style='color:gray'>(次選: {alt_id})</span>"
-                            
                     current_frame_text_results.append(info_text)
-                    
                     detected_count += 1
-                    valid_ui_counter += 1 # 只有真正顯示時才 +1
-                    
-            except Exception as e: 
-                print(e)
-                pass
+                    valid_ui_counter += 1
+            except: pass
 
         self.detected_count = detected_count
-        if detected_something:
-             self.ui_results = current_frame_text_results
+        if detected_something: self.ui_results = current_frame_text_results
 
-        # Stability 邏輯
         if len(raw_boxes_for_stability) == 0:
             self.stability_start_time = None
         elif len(self.last_boxes) == 0:
@@ -355,7 +481,6 @@ class HandwriteProcessor(VideoProcessorBase):
                     if dist < min_dist: min_dist = dist
                 if min_dist < 30: total_movement += min_dist
                 else: total_movement += 20 
-            
             count_diff = abs(len(raw_boxes_for_stability) - len(self.last_boxes))
             total_movement += count_diff * 30 
             self.last_boxes = raw_boxes_for_stability
@@ -364,85 +489,81 @@ class HandwriteProcessor(VideoProcessorBase):
                 if self.stability_start_time is None: self.stability_start_time = time.time()
                 elapsed = time.time() - self.stability_start_time
                 progress = min(elapsed / STABILITY_DURATION, 1.0)
-                
                 bar_y = h_f - 20 
                 bar_w = int(600 * progress)
                 color = (0, 255, 255) if progress < 1.0 else (0, 255, 0)
                 cv2.rectangle(display_img, (20, bar_y - 15), (20 + bar_w, bar_y), color, -1)
                 cv2.rectangle(display_img, (20, bar_y - 15), (w_f - 20, bar_y), (255, 255, 255), 2)
-                
                 if elapsed >= STABILITY_DURATION and detected_something:
                     self.frozen = True
                     self.frozen_frame = display_img.copy()
             else:
                 self.stability_start_time = time.time()
-
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
-# --- 4. Streamlit 介面 ---
+# --- 7. Streamlit 介面與入口閘門 (Gatekeeper) ---
 st.set_page_config(page_title="手寫辨識", page_icon="📝", layout="wide")
 
-if 'stats' not in st.session_state:
-    st.session_state['stats'] = {
-        'camera': {'total': 0, 'correct': 0}, 
-        'handwriting': {'total': 0, 'correct': 0},
-        'upload': {'total': 0, 'correct': 0} 
-    }
-if 'history' not in st.session_state:
-    st.session_state['history'] = {'camera': [], 'handwriting': [], 'upload': []} 
-    
-if 'input_key' not in st.session_state: st.session_state['input_key'] = 0
-if 'canvas_key' not in st.session_state: st.session_state['canvas_key'] = "canvas_0"
+# 初始化
+if 'stats' not in st.session_state: st.session_state['stats'] = {'camera': {'total': 0, 'correct': 0}, 'handwriting': {'total': 0, 'correct': 0}, 'upload': {'total': 0, 'correct': 0}}
+if 'history' not in st.session_state: st.session_state['history'] = {'camera': [], 'handwriting': [], 'upload': []} 
 if 'tracker_state' not in st.session_state: st.session_state['tracker_state'] = {}
 if 'next_id' not in st.session_state: st.session_state['next_id'] = 1
-    
 if 'hw_display_list' not in st.session_state: st.session_state['hw_display_list'] = []
 if 'hw_result_img' not in st.session_state: st.session_state['hw_result_img'] = None
 if 'hw_result_count' not in st.session_state: st.session_state['hw_result_count'] = 0
-
+if 'box_cache' not in st.session_state: st.session_state['box_cache'] = [] 
 if 'upload_display_list' not in st.session_state: st.session_state['upload_display_list'] = []
 if 'upload_result_img' not in st.session_state: st.session_state['upload_result_img'] = None
 if 'upload_result_count' not in st.session_state: st.session_state['upload_result_count'] = 0
 if 'last_uploaded_file_id' not in st.session_state: st.session_state['last_uploaded_file_id'] = None
+if 'ignored_boxes' not in st.session_state: st.session_state['ignored_boxes'] = set()
+if 'manual_boxes' not in st.session_state: st.session_state['manual_boxes'] = []
+if 'input_key' not in st.session_state: st.session_state['input_key'] = 0
+
+# --- 入口閘門 ---
+DEVICE_PC = "🖥️ 電腦版 (並排佈局)"
+DEVICE_MOBILE = "📱 手機版 (垂直佈局)"
+
+if 'last_device_mode' not in st.session_state:
+    st.markdown("<br><br><br>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>👋 歡迎使用手寫數字辨識系統</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center; color: gray;'>請選擇您的操作裝置以最佳化介面</h3>", unsafe_allow_html=True)
+    st.write("")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        c_pc, c_mo = st.columns(2)
+        with c_pc:
+            if st.button("🖥️ 電腦 / 平板", use_container_width=True, type="primary"):
+                st.session_state['last_device_mode'] = DEVICE_PC
+                st.rerun()
+        with c_mo:
+            if st.button("📱 手機", use_container_width=True, type="primary"):
+                st.session_state['last_device_mode'] = DEVICE_MOBILE
+                st.rerun()
+    st.stop()
+
+device_mode = st.session_state['last_device_mode']
+is_mobile = "手機" in device_mode
 
 with st.sidebar:
     st.title("🎛️ 控制台")
-    
-    # --- [新增] 裝置顯示設定 (含自動重置邏輯) ---
     st.markdown("### 📱 顯示設定")
-    
-    # 1. 讀取目前的模式
-    device_mode = st.radio(
-        "選擇您的裝置介面：",
-        ["🖥️ 電腦版 (並排佈局)", "📱 手機版 (垂直佈局)"],
-        index=0,
-        help="手機版會將畫面垂直排列並縮小畫布，以符合窄螢幕操作。"
-    )
-    is_mobile = "手機" in device_mode
-    
-    # 2. 偵測是否剛切換模式，如果是，強制重置狀態
-    if 'last_device_mode' not in st.session_state:
-        st.session_state['last_device_mode'] = device_mode
-
-    if st.session_state['last_device_mode'] != device_mode:
-        # ⚠️ 偵測到切換！執行大掃除
-        st.session_state['hw_result_img'] = None        # 清除舊的結果圖
-        st.session_state['hw_display_list'] = []        # 清除舊的文字列表
-        st.session_state['hw_result_count'] = 0         # 歸零計數
-        st.session_state['tracker_state'] = {}          # 清除追蹤ID
-        st.session_state['canvas_key'] = f"canvas_{time.time()}" # 強制換一張新畫布
-        
-        # 更新最後狀態並重新執行
-        st.session_state['last_device_mode'] = device_mode
+    st.info(f"目前模式：{device_mode}")
+    if st.button("🔄 重新選擇裝置"):
+        del st.session_state['last_device_mode']
+        st.session_state['hw_result_img'] = None
+        st.session_state['hw_display_list'] = []
+        st.session_state['hw_result_count'] = 0
+        st.session_state['tracker_state'] = {}
+        st.session_state['box_cache'] = []
+        st.session_state['canvas_key'] = f"canvas_{time.time()}"
         st.rerun()
-    
-    st.divider() 
-    
+    st.divider()
     app_mode = st.radio("模式選擇", ["📷 鏡頭模式 (Live)", "🎨 手寫板模式", "📁 圖片上傳模式"], index=1)
-    
     st.divider()
     
-    # --- 成績區塊 ---
+    # 成績顯示
     st.markdown("### 📷 鏡頭成績")
     c_total = st.session_state['stats']['camera']['total']
     c_correct = st.session_state['stats']['camera']['correct']
@@ -467,7 +588,6 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-
     st.markdown("### 🎨 手寫成績")
     h_total = st.session_state['stats']['handwriting']['total']
     h_correct = st.session_state['stats']['handwriting']['correct']
@@ -494,7 +614,6 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-
     st.markdown("### 📁 上傳成績")
     u_total = st.session_state['stats']['upload']['total']
     u_correct = st.session_state['stats']['upload']['correct']
@@ -521,45 +640,22 @@ with st.sidebar:
             st.session_state['upload_result_count'] = 0
             st.rerun()
 
-# --- 版面配置輔助函式 ---
-def get_responsive_layout(ratios):
-    """
-    根據 is_mobile 變數決定回傳 Columns 還是 Containers
-    """
-    if is_mobile:
-        # 手機版：回傳一組 Container (垂直堆疊)
-        return [st.container() for _ in ratios]
-    else:
-        # 電腦版：回傳 Columns (左右並排)
-        return st.columns(ratios)
-
 st.title("📝 手寫數字辨識系統")
 
-with st.expander("📖 系統操作說明 (點擊展開)", expanded=False):
-    st.markdown(f"""
-    請先選擇使用裝置
-    #### ⚠️ 提高準確率的技巧：
-    1. 手寫模式中如果發現沒出現綠色框，代表信心度過低或沒判定到，可以考慮把字寫整齊
-    2. 鏡頭模式中請將紙張拿近鏡頭，數字太小會被忽略，筆跡太細也會被忽略，盡量拿奇異筆寫。
-    3. 數字**1**不要畫底線，會被判定成其他數字。
-    4. 數字盡量寫正。
-    5. 鏡頭模式中顯示的是序號，實際數值請點選📋 顯示詳情查看
-    6. 如果鏡頭模式覺得不好用可以拍照貼到圖片上傳模式
-    7. 有想反映的問題底下有表單可以填
-    """)
-    st.write("回饋單連結")
-    st.link_button("📝 填寫回饋表單", "https://forms.gle/wAgFbVvLSsJS63439", use_container_width=True)
- 
+if model is None: st.error("❌ 找不到模型！"); st.stop()
 
-if model is None:
-    st.error("❌ 找不到 `mnist_cnn.h5`！")
-    st.stop()
-
-# --- 5. 模式分支 ---
-
+# --- 主程式分支 ---
 if app_mode == "📷 鏡頭模式 (Live)":
-    
-    # [修改] 使用響應式佈局
+    # --- 新增說明區塊 ---
+    with st.expander("📖 鏡頭模式指南(請點開)", expanded=False):
+        st.markdown("""
+        1. **對準鏡頭**：請將寫有數字的紙張平穩置於鏡頭前。
+        2. **保持穩定**：當畫面偵測到數字且畫面穩定時，下方 **藍條** 會開始集氣。
+        3. **自動抓拍**：集氣滿後畫面會自動 **凍結 (Captured)** 並顯示辨識結果。
+        4. **確認成績**：確認無誤後，於右側輸入正確數量並上傳成績。
+        5. 如果沒偵測到可能是光線問題或筆跡太細
+        """)
+    # 復原鏡頭模式功能
     layout_containers = get_responsive_layout([2, 1])
     col_cam = layout_containers[0]
     col_data = layout_containers[1]
@@ -569,7 +665,7 @@ if app_mode == "📷 鏡頭模式 (Live)":
             key="handwrite-live",
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=HandwriteProcessor,
-            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+            media_stream_constraints={"video": {"width": 1280, "height": 720}, "audio": False},
             rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             async_processing=True,
         )
@@ -579,7 +675,6 @@ if app_mode == "📷 鏡頭模式 (Live)":
         st.caption("請等待畫面出現 Captured 後，按下方按鈕更新數據")
         
         col_btn1, col_btn2 = st.columns(2)
-        
         with col_btn1:
             if st.button("📋 顯示詳情", type="secondary", use_container_width=True):
                 if ctx.video_processor and ctx.video_processor.frozen:
@@ -587,8 +682,7 @@ if app_mode == "📷 鏡頭模式 (Live)":
                     if results:
                         st.success(f"共偵測到 {len(results)} 個數字")
                         st.session_state['last_cam_detected'] = len(results)
-                        for line in results:
-                            st.markdown(line, unsafe_allow_html=True)
+                        for line in results: st.markdown(line, unsafe_allow_html=True)
                     else:
                         st.warning("⚠️ 畫面凍結了，但沒有偵測到數字。")
                         st.session_state['last_cam_detected'] = 0
@@ -597,316 +691,161 @@ if app_mode == "📷 鏡頭模式 (Live)":
 
         with col_btn2:
             if st.button("🔄 重新攝影", type="primary", use_container_width=True):
-                if ctx.video_processor:
-                    ctx.video_processor.resume()
+                if ctx.video_processor: ctx.video_processor.resume()
                 st.session_state['last_cam_detected'] = 0
                 st.rerun()
 
         st.write("---")
-        
         manual_score = st.number_input("✍️ 輸入正確數量", min_value=0, value=0, key=f"score_input_{st.session_state['input_key']}")
-        
         st.write("##") 
         if st.button("💾 上傳成績並繼續", type="primary", use_container_width=True):
-            
             total_add = st.session_state.get('last_cam_detected', 0)
             if total_add > 0 and manual_score > total_add:
                 st.error(f"❌ 錯誤：輸入數值 ({manual_score}) 超過偵測總數 ({total_add})")
             else:
-                if ctx.video_processor:
-                    ctx.video_processor.resume()
-                
+                if ctx.video_processor: ctx.video_processor.resume()
                 if total_add == 0: total_add = manual_score
-
                 if manual_score > 0:
                     st.session_state['stats']['camera']['total'] += total_add
                     st.session_state['stats']['camera']['correct'] += manual_score
-                    st.session_state['history']['camera'].append({
-                        'total': total_add,
-                        'correct': manual_score
-                    })
+                    st.session_state['history']['camera'].append({'total': total_add, 'correct': manual_score})
                     st.toast(f"✅ 鏡頭模式：已記錄 (總數{total_add}/正確{manual_score})")
                     time.sleep(0.5)
                     st.session_state['input_key'] += 1
-                    
                 st.rerun()
 
-
 elif app_mode == "🎨 手寫板模式":
-    
-    # [輔助函式] 顯示信心度條
-    def get_bar_html(confidence, is_uncertain=False):
-        percent = min(int(confidence * 100), 100)
-        if is_uncertain: color = "#ff9f43" 
-        elif confidence > 0.95: color = "#2ecc71"
-        elif confidence > 0.85: color = "#f1c40f"
-        else: color = "#e74c3c"
-        
-        return f"""
-        <div style="display: flex; align-items: center; margin-top: 4px;">
-            <div style="width: 50%; height: 8px; background-color: #444; border-radius: 4px; overflow: hidden;">
-                <div style="width: {percent}%; height: 100%; background-color: {color};"></div>
-            </div>
-            <span style="margin-left: 8px; font-size: 0.8em; color: {color};">{percent}%</span>
-        </div>
-        """
-
-    # --- [修改] 調整版面配置順序 ---
-    if is_mobile:
-        # 手機版：
-        canvas_width = 340
-        canvas_height = 230
-        
-        # [關鍵修改] 手機版：先畫布，後結果
-        c_canvas = st.container() 
-        c_res = st.container()    
-        
-    else:
-        # 電腦版：左右並排 (左邊畫布，右邊結果)
-        canvas_width = 850
-        canvas_height = 400
-        c_canvas, c_res = st.columns([3, 2])
-    
-    # --------------------------------------
+    # --- 新增說明區塊 ---
+    with st.expander("📖 手寫模式指南(請點開)", expanded=False):
+        st.markdown("""
+        * **書寫**：在黑色畫布區直接用滑鼠或手指書寫數字。
+        * **工具**：左側可切換 **✏️ 畫筆** 或 **🧽 橡皮擦**。
+        * **清除**：按「🗑️ 清除」可重置畫布與計數。
+        * 信心度低於85不會記錄
+        """)
+    if is_mobile: c_canvas = st.container(); c_res = st.container()
+    else: c_canvas, c_res = st.columns([3, 2])
 
     with c_res:
         st.markdown("### 👁️ 結果")
-        result_image_placeholder = st.empty()
-        
-        if st.session_state['hw_result_img'] is not None:
-             result_image_placeholder.image(st.session_state['hw_result_img'], channels="BGR", use_container_width=True)
-        else:
-             # 預設等待圖 (大小同步調整)
-             blank_h = 230 if is_mobile else 400
-             blank_w = 340 if is_mobile else 600
-             blank_img = np.zeros((blank_h, blank_w, 3), dtype=np.uint8)
-             cv2.putText(blank_img, "Waiting...", (30, int(blank_h/2)+10), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
-             result_image_placeholder.image(blank_img, channels="BGR", use_container_width=True, caption="請在畫布書寫")
+        res_ph = st.empty()
+        if st.session_state['hw_result_img'] is not None: res_ph.image(st.session_state['hw_result_img'], channels="BGR", use_container_width=True)
+        else: res_ph.info("請在畫布書寫")
 
-        st.write("---")
-        result_stats_placeholder = st.empty()
-
-    current_results_list = []
-    
-    # 畫布與邏輯
     with c_canvas:
-        
-        # --- [新增] 工具選擇 (畫筆 / 橡皮擦) ---
-        col_tool, col_clear = st.columns([2, 1])
-        with col_tool:
-            tool_mode = st.radio("🖊️ 工具", ["✏️ 畫筆", "🧽 橡皮擦"], horizontal=True, label_visibility="collapsed")
-        with col_clear:
-            if st.button("🗑️ 清除畫布", use_container_width=True):
+        c_tool, c_clear = st.columns([2, 1])
+        with c_tool: tool_mode = st.radio("🖊️ 工具", ["✏️ 畫筆", "🧽 橡皮擦"], horizontal=True, label_visibility="collapsed")
+        with c_clear:
+            if st.button("🗑️ 清除", use_container_width=True):
                 st.session_state['canvas_key'] = f"canvas_{time.time()}"
                 st.session_state['tracker_state'] = {}
+                st.session_state['box_cache'] = [] 
                 st.session_state['next_id'] = 1
-                st.session_state['hw_display_list'] = [] 
+                st.session_state['hw_display_list'] = []
                 st.session_state['hw_result_img'] = None
                 st.session_state['hw_result_count'] = 0
                 st.rerun()
 
-        # 設定筆刷屬性
-        if tool_mode == "✏️ 畫筆":
-            stroke_color = "#FFFFFF" # 白色
-            stroke_width = 15
-        else:
-            stroke_color = "#000000" # 黑色 (背景色) = 橡皮擦
-            stroke_width = 40       # 橡皮擦大一點比較好擦
+        merge_dist = 60       
+        erosion_iter = 0      
+        dilation_iter = 2     
+        hw_min_area = 50
 
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
-            stroke_width=stroke_width,  # 動態調整
-            stroke_color=stroke_color,  # 動態調整
+            stroke_width=15 if tool_mode == "✏️ 畫筆" else 40,
+            stroke_color="#FFFFFF" if tool_mode == "✏️ 畫筆" else "#000000",
             background_color="#000000",
-            height=canvas_height,
-            width=canvas_width,
+            height=400 if not is_mobile else 230,
+            width=850 if not is_mobile else 340,
             drawing_mode="freedraw",
-            key=st.session_state['canvas_key'],
+            key=st.session_state.get('canvas_key', 'canvas_0'),
             display_toolbar=False,
             update_streamlit=True, 
         )
-        
-        # --- 核心處理邏輯 (含視覺內縮優化) ---
+
         if canvas_result.image_data is not None:
             img_data = canvas_result.image_data.astype(np.uint8)
-            
             if np.max(img_data) > 0:
-                if img_data.shape[2] == 4:
-                    img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
-                gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
+                if img_data.shape[2] == 4: img_bgr = cv2.cvtColor(img_data, cv2.COLOR_RGBA2BGR)
+                else: img_bgr = img_data.copy()
+                
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                blur = cv2.GaussianBlur(gray, (5, 5), 0)
+                _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                binary_proc = thresh
 
-                binary_proc = cv2.dilate(gray, None, iterations=1)
-                _, binary_proc = cv2.threshold(binary_proc, 127, 255, cv2.THRESH_BINARY)
+                if erosion_iter > 0:
+                    kernel = np.ones((3,3), np.uint8)
+                    binary_proc = cv2.erode(binary_proc, kernel, iterations=erosion_iter)
+                if dilation_iter > 0:
+                    binary_proc = cv2.dilate(binary_proc, None, iterations=dilation_iter)
+
                 contours, _ = cv2.findContours(binary_proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                merged_items = merge_boxes_logic(contours, merge_dist_limit=merge_dist, time_limit=1.0)
+                tracked_items = update_tracker_from_boxes(merged_items)
                 
-                tracked_items = update_tracker(contours)
-                
-                draw_img = img_data.copy()
+                draw_img = img_bgr.copy()
                 batch_rois = []
-                flat_inputs = [] 
-                
+                final_results_list = []
+                valid_items = []
                 for item in tracked_items:
-                    cnt = item['cnt']
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    
-                    if cv2.contourArea(cnt) > MIN_AREA:
-                        roi = binary_proc[y:y+h, x:x+w]
-                        roi = deskew(roi) 
-                        
-                        side = max(w, h)
-                        pad = int(side * 0.2)
-                        container = np.zeros((side+pad*2, side+pad*2), dtype=np.uint8)
-                        ox, oy = (side+pad*2-w)//2, (side+pad*2-h)//2
-                        
-                        roi = cv2.resize(roi, (w, h))
-                        container[oy:oy+h, ox:ox+w] = roi
-                        
-                        roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
-                        roi_norm = roi_ready.astype('float32') / 255.0
-                        
-                        batch_rois.append(roi_norm.reshape(28, 28, 1))
-                        flat_inputs.append(roi_norm.reshape(1, 784))
-                
+                    x, y, w, h = item['rect']
+                    if w * h < hw_min_area: continue
+                    roi = binary_proc[y:y+h, x:x+w]
+                    side = max(w, h)
+                    pad = 40
+                    container = np.zeros((side+pad, side+pad), dtype=np.uint8)
+                    oy, ox = (side+pad-h)//2, (side+pad-w)//2
+                    container[oy:oy+h, ox:ox+w] = roi
+                    roi_ready = cv2.resize(container, (28, 28), interpolation=cv2.INTER_AREA)
+                    final_roi = center_by_moments_cnn(roi_ready)
+                    batch_rois.append(final_roi.astype('float32') / 255.0)
+                    valid_items.append(item)
+
                 detected_count = 0
-                valid_ui_counter = 1
-
                 if len(batch_rois) > 0:
-                    preds = model.predict(np.stack(batch_rois), verbose=0)
-                    
+                    inputs = np.array(batch_rois).reshape(-1, 28, 28, 1)
+                    preds = model.predict(inputs, verbose=0)
+                    ui_idx = 1
                     for i, pred in enumerate(preds):
-                        item = tracked_items[i]
-                        cnt = item['cnt']
-                        
-                        top_indices = pred.argsort()[-3:][::-1]
-                        res_id = top_indices[0]
-                        confidence = pred[res_id]
-                        
-                        if confidence < CONFIDENCE_THRESHOLD:
-                            continue
-
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        asp = w/h
-                        
-                        if res_id==1 and asp>0.6: res_id=7 
-                        if res_id==7 and asp<0.3: res_id=1
-                        
-                        is_uncertain = False
-                        verify_text_html = ""
-                        final_res = str(res_id)
-                        box_color = (0, 255, 0)
-                        
-                        if knn_model is not None and KNN_VERIFY_RANGE[0] <= confidence <= KNN_VERIFY_RANGE[1]:
-                            try:
-                                k_pred = knn_model.predict(flat_inputs[i])[0]
-                                if k_pred != res_id:
-                                    is_uncertain = True
-                                    verify_text_html = f"<div style='color:#ff9f43; font-size:0.85em; margin-bottom: 2px;'>⚠️ KNN 建議: {k_pred}</div>"
-                                    final_res = str(res_id)
-                                    box_color = (0, 165, 255)
-                            except: pass
-                        
-                        # 視覺內縮 (Shrink)
-                        dx = x + SHRINK_PX
-                        dy = y + SHRINK_PX
-                        dw = max(1, w - 2*SHRINK_PX)
-                        dh = max(1, h - 2*SHRINK_PX)
-                        
-                        cv2.rectangle(draw_img, (dx, dy), (dx+dw, dy+dh), box_color, 2)
-                        cv2.putText(draw_img, final_res, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-                        
-                        text_part = f"<div>#{valid_ui_counter}: 數字 <strong>{res_id}</strong></div>"
-                        if is_uncertain: text_part += verify_text_html
-                        elif confidence < 1.0: 
-                            alts = []
-                            for alt_idx in top_indices[1:]:
-                                if pred[alt_idx] > 0.01: alts.append(f"{alt_idx}({int(pred[alt_idx]*100)}%)")
-                            if alts: text_part += f"<div style='color:gray; font-size:0.8em'>⚠️ 其他: {', '.join(alts)}</div>"
-                        
-                        bar_part = get_bar_html(confidence, is_uncertain)
-                        current_results_list.append(f"<div style='margin-bottom:10px;'>{text_part}{bar_part}</div>")
-                        
+                        item = valid_items[i]
+                        x, y, w, h = item['rect']
+                        top_idx = pred.argsort()[-1]
+                        conf = pred[top_idx]
+                        if conf < CONFIDENCE_THRESHOLD: continue
+                        dx, dy = x + SHRINK_PX, y + SHRINK_PX
+                        dw, dh = max(1, w - 2*SHRINK_PX), max(1, h - 2*SHRINK_PX)
+                        cv2.rectangle(draw_img, (dx, dy), (dx+dw, dy+dh), (0, 255, 0), 2)
+                        text_y = y - 10 if y > 25 else y + 30
+                        cv2.putText(draw_img, str(top_idx), (x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                        final_results_list.append(f"<div><strong>#{ui_idx}</strong>: 數字 {top_idx} {get_bar_html(conf)}</div>")
                         detected_count += 1
-                        valid_ui_counter += 1
+                        ui_idx += 1
 
-                # 更新圖片與狀態 (會更新到上方的 c_res 中)
-                result_image_placeholder.image(draw_img, channels="BGR", use_container_width=True)
-                
-                st.session_state['hw_display_list'] = current_results_list
+                res_ph.image(draw_img, channels="BGR", use_container_width=True)
+                if final_results_list:
+                    c_canvas.write("---")
+                    cols = c_canvas.columns(2)
+                    for idx, line in enumerate(final_results_list):
+                        cols[idx%2].markdown(line, unsafe_allow_html=True)
                 st.session_state['hw_result_img'] = draw_img
                 st.session_state['hw_result_count'] = detected_count
 
-    # 顯示下方的詳細數據 (放在畫布下方)
-    with c_canvas:
-        if st.session_state['hw_display_list']:
-            st.write("---")
-            st.markdown("#### 📊 詳細數據:")
-            cols = st.columns(2)
-            for i, html_content in enumerate(st.session_state['hw_display_list']):
-                cols[i % 2].markdown(html_content, unsafe_allow_html=True)
-
-    status_placeholder = st.empty()
-    
-    final_count = st.session_state['hw_result_count']
-    
-    wrapper_style = "min-height: 60px; margin-bottom: 10px;"
-    
-    if final_count > 0:
-        status_html = f"""
-        <div style="{wrapper_style}">
-            <div style="
-                padding: 10px;
-                border-radius: 5px;
-                background-color: #d1e7dd; 
-                color: #0f5132;
-                border: 1px solid #badbcc;">
-                ✅ 偵測到: <strong>{final_count}</strong> 個
-            </div>
-        </div>
-        """
-    else:
-        status_html = f"""
-        <div style="{wrapper_style}">
-            <div style="
-                padding: 10px;
-                border-radius: 5px;
-                background-color: #cff4fc;
-                color: #055160;
-                border: 1px solid #b6effb;">
-                ℹ️ 等待書寫中...
-            </div>
-        </div>
-        """
-        
-    status_placeholder.markdown(status_html, unsafe_allow_html=True)
-    
-    hw_score = st.number_input("輸入數量", min_value=0, value=final_count, key="hw_input")
-    
-    st.write("##")
-    if st.button("💾 上傳成績", key="hw_save", type="primary"):
-        if hw_score > final_count:
-            st.error(f"❌ 錯誤：輸入數值 ({hw_score}) 超過偵測總數 ({final_count})")
-        else:
-            st.session_state['stats']['handwriting']['total'] += final_count
-            st.session_state['stats']['handwriting']['correct'] += hw_score
-            st.session_state['history']['handwriting'].append({'total': final_count, 'correct': hw_score})
-            
-            # 重置狀態
-            st.session_state['canvas_key'] = f"canvas_{time.time()}"
-            st.session_state['tracker_state'] = {}
-            st.session_state['next_id'] = 1
-            st.session_state['hw_display_list'] = []
-            st.session_state['hw_result_img'] = None
-            st.session_state['hw_result_count'] = 0
-            
-            if 'hw_input' in st.session_state:
-                del st.session_state['hw_input']
-            
-            st.toast("✅ 手寫成績已儲存！")
-            time.sleep(0.5)
-            st.rerun()
-
 elif app_mode == "📁 圖片上傳模式":
-
+    # --- 新增說明區塊 ---
+    with st.expander("📖 圖片上傳功能指南 (請點開)", expanded=True):
+        st.markdown("""
+        **1. 基本操作**
+        * 點擊 **Browse files** 上傳圖片，或選擇範例圖片。
+        * 系統會自動框選偵測到的數字 (綠框或橘框)。
+        
+        **2. 編輯模式 (修正錯誤用)**
+        * 開啟圖片下方的 **「🗑️ 啟用編輯模式」** 開關。
+        * **刪除誤判**：直接點擊畫面上的 **綠框** 或 **紫框** 即可刪除。
+        * **手動補點**：若有數字沒被抓到，請點擊該數字的 **黑色筆跡處**，系統會強制加入辨識 (紫框)。
+        * 若點了沒反應可考慮將圖片縮放後再點一次
+        """)
     # --- 初始化 session_state ---
     if 'ignored_boxes' not in st.session_state:
         st.session_state['ignored_boxes'] = set()
@@ -1124,12 +1063,15 @@ elif app_mode == "📁 圖片上傳模式":
 
             results_text, v_count = [], 1
             all_boxes_data = [] 
+            
+            # [修正] 將 scale 移到這裡定義，確保手動模式也能用到正確的比例
+            # 根據圖片寬度動態調整字體大小 (基準寬度 800px)
+            scale = max(1.0, img.shape[1] / 800.0)
 
             # --- [Part A] 自動偵測 ---
             if batch_rois:
                 preds = model.predict(np.stack(batch_rois), verbose=0)
                 comb = sorted(list(zip(preds, batch_info)), key=lambda x: x[1]["rect"][0])
-                scale = max(1.0, img.shape[1] / 800.0)
                 
                 for pred, info in comb:
                     bx, by, bw, bh = info["rect"]
@@ -1179,9 +1121,10 @@ elif app_mode == "📁 圖片上傳模式":
                     lbl = mbox.get('label', mbox.get('digit', '?'))
                     conf = mbox['conf']
                     
-                    cv2.rectangle(display_img, (bx, by), (bx+bw, by+bh), (255, 0, 255), 2)
+                    # [修正] 手動框的線條和字體也跟隨 scale 自動放大
+                    cv2.rectangle(display_img, (bx, by), (bx+bw, by+bh), (255, 0, 255), max(2, int(3*scale)))
                     cv2.putText(display_img, str(lbl), (bx, by - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                               1.0, (255, 0, 255), 2)
+                               1.0 * scale, (255, 0, 255), max(2, int(3*scale)))
                     
                     bar_html = get_bar_html(conf, is_uncertain=True)
                     results_text.append(f"<div><strong>#{v_count} (手動)</strong>: {lbl} {bar_html}</div>")
@@ -1195,8 +1138,6 @@ elif app_mode == "📁 圖片上傳模式":
         # --- 顯示圖片與刪除/補點邏輯 ---
         if st.session_state['upload_result_img'] is not None:
             
-            # 🟢 [修改 1] 加入滑桿：讓使用者可以自己調整大小 (手機板救星)
-            # 手機上建議調到 350-400 左右，電腦上可以用 700-800
             st.write("---") # 分隔線
             display_width = st.slider("🔍 圖片顯示大小 (手機若跑版請調小)，只有編輯模式能調", min_value=300, max_value=1000, value=700)
 
@@ -1286,8 +1227,6 @@ elif app_mode == "📁 圖片上傳模式":
                             st.toast(msg)
 
             else:
-                # 🟢 [修改 2] 瀏覽模式：使用 use_container_width=True
-                # 這會讓圖片自動適應手機螢幕寬度，不會再跑版了
                 st.image(resized_display_img_rgb, use_container_width=True)
             
             if st.session_state['upload_display_list']:
@@ -1311,18 +1250,16 @@ elif app_mode == "📁 圖片上傳模式":
         else:
              is_disabled = True
 
-        # 🟢 [修改重點]：設定 max_value=f_cnt
-        # 這樣輸入的數字就永遠不會超過偵測到的總數 (防呆)
         real_val = st.number_input(
             "正確數量", 
             min_value=0, 
-            max_value=f_cnt,  # <--- 限制最大值等於偵測數量
-            value=f_cnt,      # 預設值
+            max_value=f_cnt, 
+            value=f_cnt,      
             key="up_input_val", 
             disabled=is_disabled
         )
         
-        # 按鈕事件 (包含之前的結構防呆)
+        # 按鈕事件
         if st.button("💾 上傳成績", type="primary", use_container_width=True, disabled=is_disabled):
             try:
                 # 確保資料結構存在
