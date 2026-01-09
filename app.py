@@ -457,6 +457,9 @@ def get_bar_html(confidence, is_uncertain=False):
 # --------------------------------------------------------------------------------
 # 6. WebRTC 影像處理核心 (鏡頭模式用)
 # --------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
+# 6. WebRTC 影像處理核心 (鏡頭模式用) - 已修正暖身與防誤觸邏輯
+# --------------------------------------------------------------------------------
 class HandwriteProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = model
@@ -470,6 +473,10 @@ class HandwriteProcessor(VideoProcessorBase):
         self.frame_counter = 0      # 幀數計數器
         self.skip_rate = 4          # 每 N 幀處理一次 (節省效能)
         self.cached_rois = []       # 快取的繪圖資訊 (用於跳過的幀)
+        
+        # [新增] 暖身機制：避免開機瞬間誤判
+        self.session_start_time = time.time()
+        self.warmup_duration = 1.5  # 暖身時間 (秒)
 
     def resume(self):
         """解除凍結，恢復即時攝影"""
@@ -478,6 +485,8 @@ class HandwriteProcessor(VideoProcessorBase):
         self.last_boxes = []
         self.ui_results = [] 
         self.frame_counter = 0
+        # [新增] 重置暖身計時
+        self.session_start_time = time.time()
 
     def recv(self, frame):
         """
@@ -486,6 +495,14 @@ class HandwriteProcessor(VideoProcessorBase):
         """
         img = frame.to_ndarray(format="bgr24")
         
+        # [重要修正] 在函式最開頭計算暖身狀態，避免變數未定義錯誤
+        # 防呆檢查：若因熱重載導致變數遺失，重新初始化
+        if not hasattr(self, 'session_start_time') or self.session_start_time is None:
+            self.session_start_time = time.time()
+            self.warmup_duration = 1.5
+            
+        is_warming_up = (time.time() - self.session_start_time) < self.warmup_duration
+
         # 若已凍結，持續回傳同一張靜態圖
         if self.frozen and self.frozen_frame is not None:
             return av.VideoFrame.from_ndarray(self.frozen_frame, format="bgr24")
@@ -495,16 +512,22 @@ class HandwriteProcessor(VideoProcessorBase):
         
         # 定義感興趣區域 (ROI)，避免邊緣雜訊
         roi_rect = [ROI_MARGIN_X, ROI_MARGIN_Y, w_f - 2*ROI_MARGIN_X, h_f - 2*ROI_MARGIN_Y]
-        cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), (255, 0, 0), 2)
+        
+        # 繪製 ROI 框 (根據暖身狀態變色：紅=未準備好, 藍=正常)
+        roi_color = (0, 0, 255) if is_warming_up else (255, 0, 0)
+        cv2.rectangle(display_img, (roi_rect[0], roi_rect[1]), (roi_rect[0]+roi_rect[2], roi_rect[1]+roi_rect[3]), roi_color, 2)
 
         # 效能優化：跳幀處理
         self.frame_counter += 1
         if not (self.frame_counter % self.skip_rate == 0):
             # 在跳過的幀上繪製上一次的快取結果，避免閃爍
             if len(self.cached_rois) > 0:
-                for (dx, dy, dw, dh, txt, box_color) in self.cached_rois:
-                    cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), box_color, 2)
+                for (dx, dy, dw, dh, txt, box_color, box_thick) in self.cached_rois:
+                    cv2.rectangle(display_img, (dx, dy), (dx+dw, dy+dh), box_color, box_thick)
                     cv2.putText(display_img, txt, (dx, dy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # 補上暖身提示字 (跳幀時也要顯示)
+            if is_warming_up:
+                cv2.putText(display_img, "Initializing...", (20, h_f - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             return av.VideoFrame.from_ndarray(display_img, format="bgr24")
         
         # 提取 ROI 並進行前處理
@@ -516,7 +539,7 @@ class HandwriteProcessor(VideoProcessorBase):
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 45, 18)
         binary_proc = cv2.dilate(thresh, None, iterations=2)
         
-        # 尋找輪廓 (兩層結構，用於偵測數字是否有孔洞如 0, 8, 6, 9)
+        # 尋找輪廓
         contours, hierarchy = cv2.findContours(binary_proc, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         valid_boxes = []
         if hierarchy is not None:
@@ -530,7 +553,6 @@ class HandwriteProcessor(VideoProcessorBase):
                         has_hole = hierarchy[0][i][2] != -1
                         valid_boxes.append({"box": (x, y, w, h), "has_hole": has_hole, "aspect_ratio": w / float(h)})
         
-        # 由左至右排序
         valid_boxes = sorted(valid_boxes, key=lambda b: b["box"][0])
         batch_rois, batch_info, raw_boxes_for_stability = [], [], []
         self.cached_rois = []
@@ -538,19 +560,16 @@ class HandwriteProcessor(VideoProcessorBase):
         # 準備批量預測資料
         for item in valid_boxes:
             x, y, w, h = item["box"]
-            rx, ry = x + roi_rect[0], y + roi_rect[1] # 還原到原圖座標
+            rx, ry = x + roi_rect[0], y + roi_rect[1]
             
-            # 邊界檢查與過濾
             if x < 5 or y < 5 or (x+w) > binary_proc.shape[1]-5 or (y+h) > binary_proc.shape[0]-5: continue
             if h < MIN_HEIGHT: continue
             
-            # 色彩檢查
-            roi_color = display_img[ry:ry+h, rx:rx+w]
-            if not is_valid_content(roi_color): continue
+            roi_color_check = display_img[ry:ry+h, rx:rx+w]
+            if not is_valid_content(roi_color_check): continue
             
             raw_boxes_for_stability.append(item)
             
-            # 標準化至 28x28
             roi_single = deskew(binary_proc[y:y+h, x:x+w])
             side = max(w, h)
             padding = int(side * 0.2)
@@ -583,7 +602,6 @@ class HandwriteProcessor(VideoProcessorBase):
                     res_id = top_indices[0]
                     confidence = pred[res_id]
                     
-                    # 信心度過低則忽略
                     if confidence < CONFIDENCE_THRESHOLD: continue 
 
                     info = batch_info[i]
@@ -591,7 +609,7 @@ class HandwriteProcessor(VideoProcessorBase):
                     aspect = info["aspect"]
                     has_hole = info["has_hole"]
                     
-                    # 規則庫修正 (Rule-based correction)
+                    # 規則庫修正
                     if res_id == 1 and aspect > 0.6: res_id = 7
                     elif res_id == 7 and aspect < 0.25: res_id = 1
                     if res_id == 7 and has_hole: res_id = 9
@@ -599,30 +617,41 @@ class HandwriteProcessor(VideoProcessorBase):
                     if res_id == 0 and aspect < 0.5: res_id = 1
                     
                     final_label_str = str(res_id)
-                    box_color = (0, 255, 0)
                     verify_msg = ""
                     
-                    # KNN 雙重驗證 (針對信心度模糊區間)
+                    # KNN 雙重驗證
+                    is_knned = False
                     if self.knn is not None and KNN_VERIFY_RANGE[0] <= confidence <= KNN_VERIFY_RANGE[1]:
                         try:
                             knn_pred = self.knn.predict(info["flat_input"])[0]
                             if knn_pred != res_id:
                                 final_label_str = str(res_id)
                                 verify_msg = f" ⚠️ KNN: {knn_pred}"
-                                box_color = (0, 165, 255) # 橘色框表示警告
+                                is_knned = True
                         except: pass
                     
+                    # [修改] 根據暖身狀態決定框的顏色 (視覺回饋)
+                    if is_warming_up:
+                        box_color = (0, 0, 255)   # 紅色：暖身中，未鎖定
+                        box_thickness = 1         # 細線
+                    elif is_knned:
+                        box_color = (0, 165, 255) # 橘色：KNN 警告
+                        box_thickness = 2
+                    else:
+                        box_color = (0, 255, 0)   # 綠色：準備完成
+                        box_thickness = 2
+
                     # 繪製結果框與標籤
                     draw_x = rx + SHRINK_PX
                     draw_y = ry + SHRINK_PX
                     draw_w = max(1, w - (SHRINK_PX * 2))
                     draw_h = max(1, h - (SHRINK_PX * 2))
-                    cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), box_color, 2)
+                    cv2.rectangle(display_img, (draw_x, draw_y), (draw_x+draw_w, draw_y+draw_h), box_color, box_thickness)
                     text_label = f"#{valid_ui_counter}"
                     cv2.putText(display_img, text_label, (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     
-                    # 儲存繪圖資訊供跳幀時使用
-                    self.cached_rois.append((draw_x, draw_y, draw_w, draw_h, text_label, box_color))
+                    # 儲存繪圖資訊供跳幀使用 (多存了 box_thickness)
+                    self.cached_rois.append((draw_x, draw_y, draw_w, draw_h, text_label, box_color, box_thickness))
                     
                     info_text = f"**#{valid_ui_counter}**: 數字 `{res_id}` (信心: {int(confidence*100)}%){verify_msg}"
                     current_frame_text_results.append(info_text)
@@ -640,7 +669,6 @@ class HandwriteProcessor(VideoProcessorBase):
             self.last_boxes = raw_boxes_for_stability
             self.stability_start_time = time.time()
         else:
-            # 計算所有框相對於上一幀的移動距離總和
             total_movement = 0
             for curr_box in raw_boxes_for_stability:
                 c_x, c_y, _, _ = curr_box["box"]
@@ -652,13 +680,12 @@ class HandwriteProcessor(VideoProcessorBase):
                 if min_dist < 30: total_movement += min_dist
                 else: total_movement += 20 
             
-            # 懲罰框的數量變化
             count_diff = abs(len(raw_boxes_for_stability) - len(self.last_boxes))
             total_movement += count_diff * 30 
             self.last_boxes = raw_boxes_for_stability
 
-            # 若移動量低於閥值，開始計時 (集氣)
-            if total_movement < MOVEMENT_THRESHOLD:
+            # [修改] 若移動量低於閥值，且「不在暖身期」，才開始集氣
+            if total_movement < MOVEMENT_THRESHOLD and not is_warming_up:
                 if self.stability_start_time is None: self.stability_start_time = time.time()
                 elapsed = time.time() - self.stability_start_time
                 progress = min(elapsed / STABILITY_DURATION, 1.0)
@@ -675,7 +702,11 @@ class HandwriteProcessor(VideoProcessorBase):
                     self.frozen = True
                     self.frozen_frame = display_img.copy()
             else:
-                self.stability_start_time = time.time() # 晃動太大，重置計時
+                self.stability_start_time = time.time() # 晃動太大或暖身中，重置計時
+                
+                # [新增] 暖身中的文字提示
+                if is_warming_up:
+                    cv2.putText(display_img, "Initializing...", (20, h_f - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 
         return av.VideoFrame.from_ndarray(display_img, format="bgr24")
 
