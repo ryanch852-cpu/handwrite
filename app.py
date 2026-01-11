@@ -963,21 +963,17 @@ elif app_mode == "🎨 手寫板模式":
         current_cnt = st.session_state.get('hw_result_count', 0)
         
         # 輸入正確數量
-        # [修改點] 這裡加上 max_value=current_cnt 限制上限
+        # [修正] 移除 max_value 限制，讓您可以自由輸入正確數字 (包含修正 AI 漏抓的情況)
         hw_manual_val = st.number_input(
             "正確數量", 
             min_value=0, 
-            max_value=current_cnt,  # <--- 加入這行防呆，限制不能超過偵測數
             value=current_cnt, 
             key="hw_input_val"
         )
         
         # 存檔按鈕
         if st.button("💾 上傳手寫成績", type="primary", use_container_width=True):
-            # [修改點] 雙重檢查：確保輸入值不大於偵測值 (雖然 UI 擋住了，但後端再檢查一次更保險)
-            if current_cnt > 0 and hw_manual_val >= current_cnt:
-                st.error(f"❌ 錯誤：輸入數量 ({hw_manual_val}) 不能超過偵測總數 ({current_cnt})")
-            elif hw_manual_val > 0:
+            if hw_manual_val > 0:
                 # 寫入統計數據
                 st.session_state['stats']['handwriting']['total'] += current_cnt
                 st.session_state['stats']['handwriting']['correct'] += hw_manual_val
@@ -989,6 +985,13 @@ elif app_mode == "🎨 手寫板模式":
                 })
                 
                 st.toast(f"✅ 已儲存！(偵測: {current_cnt} / 正確: {hw_manual_val})")
+                
+                # 選擇性：存檔後若想自動清除畫布，可取消下面註解
+                # time.sleep(0.5)
+                # st.session_state['canvas_key'] = f"canvas_{time.time()}"
+                # st.session_state['hw_result_img'] = None
+                # st.session_state['hw_result_count'] = 0
+                # st.rerun()
             else:
                 st.warning("⚠️ 數量為 0，無法上傳")
 
