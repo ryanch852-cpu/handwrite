@@ -921,7 +921,7 @@ if app_mode == "📷 鏡頭模式 (Live)":
         st.write("##") 
         if st.button("💾 上傳成績並繼續", type="primary", use_container_width=True):
             total_add = st.session_state.get('last_cam_detected', 0)
-            if total_add > 0 and manual_score > total_add:
+            if total_add > 0 and manual_score >= total_add:
                 st.error(f"❌ 錯誤：輸入數值 ({manual_score}) 超過偵測總數 ({total_add})")
             else:
                 if ctx.video_processor: ctx.video_processor.resume()
@@ -975,7 +975,7 @@ elif app_mode == "🎨 手寫板模式":
         # 存檔按鈕
         if st.button("💾 上傳手寫成績", type="primary", use_container_width=True):
             # [修改點] 雙重檢查：確保輸入值不大於偵測值 (雖然 UI 擋住了，但後端再檢查一次更保險)
-            if current_cnt > 0 and hw_manual_val > current_cnt:
+            if current_cnt > 0 and hw_manual_val >= current_cnt:
                 st.error(f"❌ 錯誤：輸入數量 ({hw_manual_val}) 不能超過偵測總數 ({current_cnt})")
             elif hw_manual_val > 0:
                 # 寫入統計數據
