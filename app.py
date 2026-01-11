@@ -963,26 +963,28 @@ elif app_mode == "🎨 手寫板模式":
         current_cnt = st.session_state.get('hw_result_count', 0)
         
         # 輸入正確數量
-        # [修改點] 這裡加上 max_value=current_cnt 限制上限
+        # [修改] 移除 max_value 參數，避免 UI 卡死或因 Lag 報錯
         hw_manual_val = st.number_input(
             "正確數量", 
             min_value=0, 
-            max_value=current_cnt,  # <--- 加入這行防呆，限制不能超過偵測數
             value=current_cnt, 
             key="hw_input_val"
         )
         
         # 存檔按鈕
         if st.button("💾 上傳手寫成績", type="primary", use_container_width=True):
-            # [修改點] 雙重檢查：確保輸入值不大於偵測值 (雖然 UI 擋住了，但後端再檢查一次更保險)
-            if current_cnt > 0 and hw_manual_val >= current_cnt:
-                st.error(f"❌ 錯誤：輸入數量 ({hw_manual_val}) 不能超過偵測總數 ({current_cnt})")
+            # [新增] 軟性防呆檢查：在按鈕按下時才檢查
+            if current_cnt == 0 and hw_manual_val > 0:
+                 st.error("❌ 錯誤：目前沒有偵測到任何數字，無法輸入成績。")
+            elif hw_manual_val > current_cnt:
+                # 這裡擋住超過的情況，防止 300% 準確率發生
+                st.error(f"❌ 錯誤：輸入數量 ({hw_manual_val}) 超過偵測總數 ({current_cnt})。")
+                st.caption("💡 「正確數量」是指系統抓到的框框中，有幾個是正確的，所以不可能比總框框數還多。")
             elif hw_manual_val > 0:
-                # 寫入統計數據
+                # 通過檢查，執行存檔
                 st.session_state['stats']['handwriting']['total'] += current_cnt
                 st.session_state['stats']['handwriting']['correct'] += hw_manual_val
                 
-                # 寫入歷史紀錄
                 st.session_state['history']['handwriting'].append({
                     'total': current_cnt, 
                     'correct': hw_manual_val
