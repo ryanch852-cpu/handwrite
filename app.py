@@ -963,7 +963,6 @@ elif app_mode == "🎨 手寫板模式":
         current_cnt = st.session_state.get('hw_result_count', 0)
         
         # 輸入正確數量
-        # [修改] 移除 max_value 參數，避免 UI 卡死或因 Lag 報錯
         hw_manual_val = st.number_input(
             "正確數量", 
             min_value=0, 
@@ -973,26 +972,36 @@ elif app_mode == "🎨 手寫板模式":
         
         # 存檔按鈕
         if st.button("💾 上傳手寫成績", type="primary", use_container_width=True):
-            # [新增] 軟性防呆檢查：在按鈕按下時才檢查
-            if current_cnt == 0 and hw_manual_val > 0:
-                 st.error("❌ 錯誤：目前沒有偵測到任何數字，無法輸入成績。")
+            # [防護 2] 防止空包彈
+            if current_cnt == 0:
+                 st.warning("⚠️ 目前畫布上沒有偵測到任何數字，無法上傳成績。")
+            
+            # [防護 3] 防止灌水數據
             elif hw_manual_val > current_cnt:
-                # 這裡擋住超過的情況，防止 300% 準確率發生
                 st.error(f"❌ 錯誤：輸入數量 ({hw_manual_val}) 超過偵測總數 ({current_cnt})。")
-                st.caption("💡 「正確數量」是指系統抓到的框框中，有幾個是正確的，所以不可能比總框框數還多。")
+                st.caption("💡 邏輯錯誤：『正確的數量』不可能大於『總共抓到的數量』。")
+            
+            # [正常情況] 存檔
             elif hw_manual_val > 0:
-                # 通過檢查，執行存檔
+                # 寫入統計數據
                 st.session_state['stats']['handwriting']['total'] += current_cnt
                 st.session_state['stats']['handwriting']['correct'] += hw_manual_val
                 
+                # 寫入歷史紀錄
                 st.session_state['history']['handwriting'].append({
                     'total': current_cnt, 
                     'correct': hw_manual_val
                 })
                 
                 st.toast(f"✅ 已儲存！(偵測: {current_cnt} / 正確: {hw_manual_val})")
+                
+                # [新增] 強制馬上更新側邊欄數據
+                time.sleep(0.1) # 稍微停頓讓 toast 能顯示出來
+                st.rerun()      # <--- 關鍵！這行會讓頁面立刻重整，側邊欄數字就會跳動了
+            
+            # [防護 4] 輸入為 0
             else:
-                st.warning("⚠️ 數量為 0，無法上傳")
+                st.warning("⚠️ 數量為 0，無需上傳")
 
     with c_canvas:
         c_tool, c_clear = st.columns([2, 1])
